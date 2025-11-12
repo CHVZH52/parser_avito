@@ -21,6 +21,7 @@ build:
 run:
 	docker run -d \
 		--name $(CONTAINER_NAME) \
+		--env-file .env \
 		-v $(CURDIR):/app \
 		$(IMAGE_NAME)
 

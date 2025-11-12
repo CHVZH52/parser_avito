@@ -87,7 +87,7 @@ def main(page: ft.Page):
     def save_config():
         """Сохраняет настройки в TOML"""
         config = {"avito": {
-            "tg_token": tg_token.value or "",
+            "tg_token": "",  
             "tg_chat_id": tg_chat_id.value.splitlines() if tg_chat_id.value else [],
             "urls": url_input.value.splitlines() if url_input.value else [],
             "count": to_int_safe(count_page.value, 1),

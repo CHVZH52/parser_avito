@@ -19,6 +19,14 @@ class ProxySplit:
 @dataclass
 class AvitoConfig:
     urls: List[str]
+    # текстовые запросы
+    queries: List[str] = field(default_factory=list)
+    # регион
+    region_slug: Optional[str] = None
+    # Флаг сортировки по новым объявлениям (эквивалентно параметру s=104 в ссылке)
+    sort_new: bool = False
+    # Фильтр: только объявления с доставкой
+    delivery_only: bool = False
     proxy_string: Optional[str] = None
     proxy_change_url: Optional[str] = None
     keys_word_white_list: List[str] = field(default_factory=list)
@@ -41,4 +49,3 @@ class AvitoConfig:
     one_file_for_link: bool = False
     parse_views: bool = False
     save_xlsx: bool = True
-

@@ -3,12 +3,16 @@ import html
 import json
 import random
 import re
+import sys
+import tempfile
 import time
-from urllib.parse import unquote, urlparse, parse_qs, urlencode, urlunparse
 from datetime import datetime, timedelta
+from pathlib import Path
+from urllib.parse import unquote, urlparse, parse_qs, urlencode, urlunparse, quote_plus
 
 from bs4 import BeautifulSoup
 from curl_cffi import requests
+import os
 from loguru import logger
 from pydantic import ValidationError
 from requests.cookies import RequestsCookieJar
@@ -26,7 +30,28 @@ from xlsx_service import XLSXHandler
 
 DEBUG_MODE = False
 
-logger.add("logs/app.log", rotation="5 MB", retention="5 days", level="DEBUG")
+def _configure_logging() -> None:
+    def _try_add(path: Path) -> bool:
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            logger.add(path, rotation="5 MB", retention="5 days", level="DEBUG")
+            return True
+        except PermissionError:
+            return False
+
+    project_log = Path(__file__).resolve().parent / "logs" / "app.log"
+    if _try_add(project_log):
+        return
+
+    fallback_log = Path(tempfile.gettempdir()) / "avito_parser_logs" / "app.log"
+    if _try_add(fallback_log):
+        logger.info(f"Логи сохраняются в {fallback_log} из-за ограничений доступа")
+        return
+
+    logger.add(sys.stderr, level="DEBUG")
+    logger.warning("Не удалось создать файл журнала — пишем в stdout")
+
+_configure_logging()
 
 
 class AvitoParse:
@@ -39,6 +64,8 @@ class AvitoParse:
         self.proxy_obj = self.get_proxy_obj()
         self.db_handler = SQLiteDBHandler()
         self.tg_handler = self.get_tg_handler()
+        self.result_dir = self._ensure_result_dir()
+        self.cookies_file = self._resolve_cookies_path()
         self.xlsx_handler = XLSXHandler(self.__get_file_title())
         self.stop_event = stop_event
         self.cookies = None
@@ -92,20 +119,26 @@ class AvitoParse:
 
     def save_cookies(self) -> None:
         """Сохраняет cookies из requests.Session в JSON-файл."""
-        with open("cookies.json", "w") as f:
-            json.dump(self.session.cookies.get_dict(), f)
+        try:
+            with self.cookies_file.open("w", encoding="utf-8") as f:
+                json.dump(self.session.cookies.get_dict(), f)
+        except PermissionError:
+            fallback = Path(tempfile.gettempdir()) / "avito_parser_cookies.json"
+            fallback.parent.mkdir(parents=True, exist_ok=True)
+            with fallback.open("w", encoding="utf-8") as f:
+                json.dump(self.session.cookies.get_dict(), f)
 
     def load_cookies(self) -> None:
         """Загружает cookies из JSON-файла в requests.Session."""
         try:
-            with open("cookies.json", "r") as f:
+            with self.cookies_file.open("r", encoding="utf-8") as f:
                 cookies = json.load(f)
-                jar = RequestsCookieJar()
-                for k, v in cookies.items():
-                    jar.set(k, v)
-                self.session.cookies.update(jar)
-        except FileNotFoundError:
-            pass
+        except (FileNotFoundError, PermissionError):
+            return
+        jar = RequestsCookieJar()
+        for k, v in cookies.items():
+            jar.set(k, v)
+        self.session.cookies.update(jar)
 
     def fetch_data(self, url, retries=3, backoff_factor=1):
         proxy_data = None
@@ -159,8 +192,11 @@ class AvitoParse:
     def parse(self):
         if self.config.one_file_for_link:
             self.xlsx_handler = None
+        # queries -> URL
+        input_links = self._resolve_input_links()
 
-        for _index, url in enumerate(self.config.urls):
+        for _index, url in enumerate(input_links):
+            logger.info(f"Старт обработки: {url}")
             ads_in_link = []
             for i in range(0, self.config.count):
                 if self.stop_event and self.stop_event.is_set():
@@ -209,6 +245,8 @@ class AvitoParse:
                         ads_in_link.extend(filter_ads)
 
                 url = self.get_next_page_url(url=url)
+                if url:
+                    logger.info(f"Следующая страница: {url}")
 
                 logger.info(f"Пауза {self.config.pause_between_links} сек.")
                 time.sleep(self.config.pause_between_links)
@@ -265,6 +303,7 @@ class AvitoParse:
             self._filter_by_black_keywords,
             self._filter_by_white_keyword,
             self._filter_by_address,
+            self._filter_by_delivery,
             self._filter_by_seller,
             self._filter_by_recent_time,
             self._filter_by_reserve,
@@ -310,6 +349,15 @@ class AvitoParse:
             return [ad for ad in ads if self.config.geo in ad.geo.formattedAddress]
         except Exception as err:
             logger.debug(f"Ошибка при проверке объявлений по адресу: {err}")
+            return ads
+
+    def _filter_by_delivery(self, ads: list[Item]) -> list[Item]:
+        if not getattr(self.config, "delivery_only", False):
+            return ads
+        try:
+            return [ad for ad in ads if (ad.contacts and ad.contacts.delivery)]
+        except Exception as err:
+            logger.debug(f"Ошибка при фильтрации по доставке: {err}")
             return ads
 
     def _filter_viewed(self, ads: list[Item]) -> list[Item]:
@@ -444,12 +492,40 @@ class AvitoParse:
     def __get_file_title(self) -> str:
         """Определяет название файла"""
         title_file = 'all'
-        if self.config.keys_word_white_list:
+        if getattr(self.config, "queries", None):
+            title_file = "-".join(list(map(str.lower, self.config.queries)))
+            if len(title_file) > 50:
+                title_file = title_file[:50]
+        elif self.config.keys_word_white_list:
             title_file = "-".join(list(map(str.lower, self.config.keys_word_white_list)))
             if len(title_file) > 50:
                 title_file = title_file[:50]
 
-        return f"result/{title_file}.xlsx"
+        return str(self.result_dir / f"{title_file}.xlsx")
+
+    def _ensure_result_dir(self) -> Path:
+        default = Path(__file__).resolve().parent / "result"
+        try:
+            default.mkdir(parents=True, exist_ok=True)
+            if not os.access(default, os.W_OK | os.X_OK):
+                raise PermissionError("Нет прав на запись/вход в result/")
+            return default
+        except PermissionError as err:
+            fallback = Path(tempfile.gettempdir()) / "avito_parser_result"
+            fallback.mkdir(parents=True, exist_ok=True)
+            logger.info(f"{err} — сохраняем в {fallback}")
+            return fallback
+
+    def _resolve_cookies_path(self) -> Path:
+        default = Path(__file__).resolve().parent / "cookies.json"
+        try:
+            default.parent.mkdir(parents=True, exist_ok=True)
+            return default
+        except PermissionError:
+            fallback = Path(tempfile.gettempdir()) / "avito_parser_cookies.json"
+            fallback.parent.mkdir(parents=True, exist_ok=True)
+            logger.info(f"Используем {fallback} для cookies из-за прав доступа")
+            return fallback
 
     def __save_data(self, ads: list[Item]) -> None:
         """Сохраняет результат в файл keyword*.xlsx и в БД"""
@@ -481,6 +557,33 @@ class AvitoParse:
             return next_url
         except Exception as err:
             logger.error(f"Не смог сформировать ссылку на следующую страницу для {url}. Ошибка: {err}")
+
+    # формирования ссылок по запросу 
+    def _resolve_input_links(self) -> list[str]:
+        links: list[str] = []
+        queries = getattr(self.config, "queries", None) or []
+        if queries:
+            for q in queries:
+                search_url = self._build_search_url(q)
+                logger.info(f"Сформирована поисковая ссылка для запроса '{q}': {search_url}")
+                links.append(search_url)
+        else:
+            links = list(self.config.urls or [])
+        return links
+
+    def _build_search_url(self, query: str) -> str:
+        """
+        Формат: https://www.avito.ru/{region_slug|all}?q=<query>[&s=104][&p=1]
+        """
+        region = (self.config.region_slug or "all").strip("/")
+        base = f"https://www.avito.ru/{region}"
+
+        params_items = [("cd", 1), ("q", query.lower())]
+        if getattr(self.config, "sort_new", False):
+            params_items.append(("s", 104))
+
+        query_str = urlencode(params_items, doseq=True)
+        return f"{base}?{query_str}"
 
 
 if __name__ == "__main__":
