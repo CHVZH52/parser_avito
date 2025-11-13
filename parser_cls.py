@@ -1,4 +1,5 @@
 import asyncio
+from copy import deepcopy
 import html
 import json
 import random
@@ -24,6 +25,7 @@ from dto import Proxy, AvitoConfig, SearchQuery
 from get_cookies import get_cookies
 from hide_private_data import log_config
 from load_config import load_avito_config
+from user_filters import UserFiltersStorage
 from models import ItemsResponse, Item
 from tg_sender import SendAdToTg
 from version import VERSION
@@ -35,7 +37,6 @@ REGION_URL_MAP = {
     "all": "all",
     "moscow": "moskva",
     "moscow_mo": "moskva_i_mo",
-    "moscow_only": "moskva",
     "mo": "moskovskaya_oblast",
     "moscow_region": "moskovskaya_oblast",
 }
@@ -76,6 +77,7 @@ class AvitoParse:
         self.result_dir = self._ensure_result_dir()
         self.cookies_file = self._resolve_cookies_path()
         self.db_path = self._resolve_db_path()
+        self.chat_owner = self._resolve_chat_owner()
         self.db_handler = SQLiteDBHandler(db_name=str(self.db_path))
         self.tg_handler = self.get_tg_handler()
         self.xlsx_handler = XLSXHandler(self.__get_file_title())
@@ -253,7 +255,7 @@ class AvitoParse:
                 filter_ads = self.parse_views(ads=filter_ads)
 
                 if filter_ads:
-                    self.__save_viewed(ads=filter_ads)
+                    self.__save_viewed(ads=filter_ads, chat_owner=self.chat_owner)
 
                     if self.config.save_xlsx:
                         ads_in_link.extend(filter_ads)
@@ -562,6 +564,12 @@ class AvitoParse:
             logger.info(f"{err} — используем {fallback}")
             return fallback
 
+    def _resolve_chat_owner(self) -> str:
+        chats = self.config.tg_chat_id or []
+        if len(chats) == 1:
+            return str(chats[0])
+        return "global"
+
     def _resolve_cookies_path(self) -> Path:
         default = Path(__file__).resolve().parent / "cookies.json"
         try:
@@ -618,10 +626,10 @@ class AvitoParse:
         except Exception as err:
             logger.info(f"При сохранении в Excel ошибка {err}")
 
-    def __save_viewed(self, ads: list[Item]) -> None:
+    def __save_viewed(self, ads: list[Item], chat_owner: str) -> None:
         """Сохраняет просмотренные объявления"""
         try:
-            self.db_handler.add_record_from_page(ads=ads)
+            self.db_handler.add_record_from_page(ads=ads, chat_id=chat_owner)
         except Exception as err:
             logger.info(f"При сохранении в БД ошибка {err}")
 
@@ -679,9 +687,9 @@ class AvitoParse:
         max_price = search.max_price if search.max_price is not None else (
             self.config.max_price if self.config.max_price and self.config.max_price < 999_999_999 else None
         )
-        if min_price:
+        if min_price is not None:
             params_items.append(("pmin", min_price))
-        if max_price:
+        if max_price is not None:
             params_items.append(("pmax", max_price))
 
         if search.delivery == "delivery_only":
@@ -697,6 +705,26 @@ class AvitoParse:
         return f"{base}?{query_str}"
 
 
+def build_user_configs(base_config: AvitoConfig, storage: UserFiltersStorage) -> list[AvitoConfig]:
+    user_map = storage.get_all_searches()
+    if not user_map:
+        return [base_config]
+
+    configs: list[AvitoConfig] = []
+    for chat_id, searches in user_map.items():
+        if not searches:
+            continue
+        cfg = deepcopy(base_config)
+        cfg.searches = searches
+        cfg.queries = [search.text for search in searches]
+        cfg.tg_chat_id = [str(chat_id)]
+        configs.append(cfg)
+
+    if not configs:
+        configs.append(base_config)
+    return configs
+
+
 if __name__ == "__main__":
     try:
         config = load_avito_config("config.toml")
@@ -704,10 +732,14 @@ if __name__ == "__main__":
         logger.error(f"Ошибка загрузки конфига: {err}")
         exit(1)
 
+    filters_storage = UserFiltersStorage()
+
     while True:
         try:
-            parser = AvitoParse(config)
-            parser.parse()
+            configs_to_run = build_user_configs(config, filters_storage)
+            for cfg in configs_to_run:
+                parser = AvitoParse(cfg)
+                parser.parse()
             if config.one_time_start:
                 logger.info("Парсинг завершен т.к. включён one_time_start в настройках")
                 break

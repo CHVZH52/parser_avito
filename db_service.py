@@ -25,48 +25,68 @@ class SQLiteDBHandler:
             cursor.execute(
                 """
                 CREATE TABLE IF NOT EXISTS viewed (
-                    id INTEGER PRIMARY KEY,
-                    price INTEGER
+                    chat_id TEXT NOT NULL,
+                    id INTEGER NOT NULL,
+                    price INTEGER,
+                    PRIMARY KEY(chat_id, id)
                 )
                 """
             )
-            cursor.execute(
-                "CREATE UNIQUE INDEX IF NOT EXISTS idx_viewed_id ON viewed(id)"
-            )
+            columns = [row[1] for row in cursor.execute("PRAGMA table_info(viewed)").fetchall()]
+            if "chat_id" not in columns:
+                cursor.execute("ALTER TABLE viewed RENAME TO viewed_old")
+                cursor.execute(
+                    """
+                    CREATE TABLE viewed (
+                        chat_id TEXT NOT NULL,
+                        id INTEGER NOT NULL,
+                        price INTEGER,
+                        PRIMARY KEY(chat_id, id)
+                    )
+                    """
+                )
+                cursor.execute(
+                    "INSERT INTO viewed (chat_id, id, price) SELECT 'global', id, price FROM viewed_old"
+                )
+                cursor.execute("DROP TABLE viewed_old")
             conn.commit()
 
-    def add_record(self, ad: Item):
+    def add_record(self, ad: Item, chat_id: str = "global"):
         """Добавляет новую запись в таблицу viewed."""
         value = self._extract_price(ad)
         with sqlite3.connect(self.db_name) as conn:
             cursor = conn.cursor()
             cursor.execute(
                 """
-                INSERT INTO viewed (id, price)
-                VALUES (?, ?)
-                ON CONFLICT(id) DO UPDATE SET price = excluded.price
+                INSERT INTO viewed (chat_id, id, price)
+                VALUES (?, ?, ?)
+                ON CONFLICT(chat_id, id) DO UPDATE SET price = excluded.price
                 """,
-                (ad.id, value),
+                (chat_id, ad.id, value),
             )
             conn.commit()
 
-    def add_record_from_page(self, ads: list[Item]):
+    def add_record_from_page(self, ads: list[Item], chat_id: str = "global"):
         """Добавляет несколько записей в таблицу viewed."""
-        records = [(ad.id, self._extract_price(ad)) for ad in ads if ad.id]
+        records = [
+            (chat_id, ad.id, self._extract_price(ad))
+            for ad in ads
+            if ad.id
+        ]
 
         with sqlite3.connect(self.db_name) as conn:
             cursor = conn.cursor()
             cursor.executemany(
                 """
-                INSERT INTO viewed (id, price)
-                VALUES (?, ?)
-                ON CONFLICT(id) DO UPDATE SET price = excluded.price
+                INSERT INTO viewed (chat_id, id, price)
+                VALUES (?, ?, ?)
+                ON CONFLICT(chat_id, id) DO UPDATE SET price = excluded.price
                 """,
                 records,
             )
             conn.commit()
 
-    def record_exists(self, record_id, price, track_price_changes: bool = True):
+    def record_exists(self, record_id, price, chat_id: str = "global", track_price_changes: bool = True):
         """Проверяет, существует ли запись с заданными параметрами."""
         if record_id is None:
             return False
@@ -74,13 +94,13 @@ class SQLiteDBHandler:
             cursor = conn.cursor()
             if track_price_changes:
                 cursor.execute(
-                    "SELECT 1 FROM viewed WHERE id = ? AND price = ?",
-                    (record_id, price),
+                    "SELECT 1 FROM viewed WHERE chat_id = ? AND id = ? AND price = ?",
+                    (chat_id, record_id, price),
                 )
             else:
                 cursor.execute(
-                    "SELECT 1 FROM viewed WHERE id = ?",
-                    (record_id,),
+                    "SELECT 1 FROM viewed WHERE chat_id = ? AND id = ?",
+                    (chat_id, record_id),
                 )
             return cursor.fetchone() is not None
 
