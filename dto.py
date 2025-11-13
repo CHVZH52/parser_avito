@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import List, Optional, Literal
 
 
 @dataclass
@@ -16,16 +16,27 @@ class ProxySplit:
     change_ip_link: str
 
 
+DeliveryMode = Literal["any", "delivery_only", "pickup_only"]
+RegionPreset = Literal["all", "moscow", "moscow_mo", "mo"]
+
+
+@dataclass
+class SearchQuery:
+    text: str
+    region: RegionPreset = "all"
+    min_price: Optional[int] = None
+    max_price: Optional[int] = None
+    delivery: DeliveryMode = "any"
+    sort_new: Optional[bool] = None
+    track_price_changes: bool = True
+
+
 @dataclass
 class AvitoConfig:
     urls: List[str]
-    # текстовые запросы
     queries: List[str] = field(default_factory=list)
-    # регион
     region_slug: Optional[str] = None
-    # Флаг сортировки по новым объявлениям (эквивалентно параметру s=104 в ссылке)
     sort_new: bool = False
-    # Фильтр: только объявления с доставкой
     delivery_only: bool = False
     proxy_string: Optional[str] = None
     proxy_change_url: Optional[str] = None
@@ -34,7 +45,7 @@ class AvitoConfig:
     seller_black_list: List[str] = field(default_factory=list)
     count: int = 1
     tg_token: Optional[str] = None
-    tg_chat_id: List[str] = None
+    tg_chat_id: List[str] | None = None
     max_price: int = 999_999_999
     min_price: int = 0
     geo: Optional[str] = None
@@ -49,3 +60,4 @@ class AvitoConfig:
     one_file_for_link: bool = False
     parse_views: bool = False
     save_xlsx: bool = True
+    searches: List[SearchQuery] = field(default_factory=list)

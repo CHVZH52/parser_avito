@@ -8,7 +8,8 @@ import tempfile
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
-from urllib.parse import unquote, urlparse, parse_qs, urlencode, urlunparse, quote_plus
+from typing import Optional
+from urllib.parse import unquote, urlparse, parse_qs, urlencode, urlunparse
 
 from bs4 import BeautifulSoup
 from curl_cffi import requests
@@ -19,7 +20,7 @@ from requests.cookies import RequestsCookieJar
 
 from common_data import HEADERS
 from db_service import SQLiteDBHandler
-from dto import Proxy, AvitoConfig
+from dto import Proxy, AvitoConfig, SearchQuery
 from get_cookies import get_cookies
 from hide_private_data import log_config
 from load_config import load_avito_config
@@ -29,6 +30,15 @@ from version import VERSION
 from xlsx_service import XLSXHandler
 
 DEBUG_MODE = False
+
+REGION_URL_MAP = {
+    "all": "all",
+    "moscow": "moskva",
+    "moscow_mo": "moskva_i_mo",
+    "moscow_only": "moskva",
+    "mo": "moskovskaya_oblast",
+    "moscow_region": "moskovskaya_oblast",
+}
 
 def _configure_logging() -> None:
     def _try_add(path: Path) -> bool:
@@ -62,10 +72,12 @@ class AvitoParse:
     ):
         self.config = config
         self.proxy_obj = self.get_proxy_obj()
-        self.db_handler = SQLiteDBHandler()
-        self.tg_handler = self.get_tg_handler()
+        self.active_search = None
         self.result_dir = self._ensure_result_dir()
         self.cookies_file = self._resolve_cookies_path()
+        self.db_path = self._resolve_db_path()
+        self.db_handler = SQLiteDBHandler(db_name=str(self.db_path))
+        self.tg_handler = self.get_tg_handler()
         self.xlsx_handler = XLSXHandler(self.__get_file_title())
         self.stop_event = stop_event
         self.cookies = None
@@ -82,6 +94,8 @@ class AvitoParse:
         return None
 
     def _send_to_tg(self, ads: list[Item]) -> None:
+        if not self.tg_handler:
+            return
         for ad in ads:
             self.tg_handler.send_to_tg(ad=ad)
 
@@ -192,10 +206,10 @@ class AvitoParse:
     def parse(self):
         if self.config.one_file_for_link:
             self.xlsx_handler = None
-        # queries -> URL
-        input_links = self._resolve_input_links()
+        resolved_targets = self._resolve_input_links()
 
-        for _index, url in enumerate(input_links):
+        for _index, (search_meta, url) in enumerate(resolved_targets):
+            self.active_search = search_meta
             logger.info(f"Старт обработки: {url}")
             ads_in_link = []
             for i in range(0, self.config.count):
@@ -213,7 +227,7 @@ class AvitoParse:
                     continue
 
                 if not self.xlsx_handler and self.config.one_file_for_link:
-                    self.xlsx_handler = XLSXHandler(f"result/{_index + 1}.xlsx")
+                    self.xlsx_handler = XLSXHandler(self._single_file_path(_index, search_meta))
 
                 data_from_page = self.find_json_on_page(html_code=html_code)
                 try:
@@ -259,6 +273,7 @@ class AvitoParse:
 
             if self.config.one_file_for_link:
                 self.xlsx_handler = None
+            self.active_search = None
 
         logger.info(f"Хорошие запросы: {self.good_request_count}шт, плохие: {self.bad_request_count}шт")
 
@@ -318,11 +333,21 @@ class AvitoParse:
         return ads
 
     def _filter_by_price_range(self, ads: list[Item]) -> list[Item]:
-        try:
-            return [ad for ad in ads if self.config.min_price <= ad.priceDetailed.value <= self.config.max_price]
-        except Exception as err:
-            logger.debug(f"Ошибка при фильтрации по цене: {err}")
+        min_price, max_price = self._get_active_price_bounds()
+        if min_price is None and max_price is None:
             return ads
+        filtered = []
+        for ad in ads:
+            try:
+                price_value = ad.priceDetailed.value
+            except Exception:
+                continue
+            if min_price is not None and price_value < min_price:
+                continue
+            if max_price is not None and price_value > max_price:
+                continue
+            filtered.append(ad)
+        return filtered
 
     def _filter_by_black_keywords(self, ads: list[Item]) -> list[Item]:
         if not self.config.keys_word_black_list:
@@ -352,17 +377,21 @@ class AvitoParse:
             return ads
 
     def _filter_by_delivery(self, ads: list[Item]) -> list[Item]:
-        if not getattr(self.config, "delivery_only", False):
+        mode = self._active_delivery_mode()
+        if mode == "any":
             return ads
         try:
-            return [ad for ad in ads if (ad.contacts and ad.contacts.delivery)]
+            if mode == "delivery_only":
+                return [ad for ad in ads if ad.contacts and ad.contacts.delivery]
+            return [ad for ad in ads if not (ad.contacts and ad.contacts.delivery)]
         except Exception as err:
             logger.debug(f"Ошибка при фильтрации по доставке: {err}")
             return ads
 
     def _filter_viewed(self, ads: list[Item]) -> list[Item]:
+        track_price_changes = self._should_track_price_changes()
         try:
-            return [ad for ad in ads if not self.is_viewed(ad=ad)]
+            return [ad for ad in ads if not self.is_viewed(ad=ad, track_price_changes=track_price_changes)]
         except Exception as err:
             logger.debug(f"Ошибка при проверке объявления по признаку смотрели или не смотрели: {err}")
             return ads
@@ -479,9 +508,14 @@ class AvitoParse:
         full_text_from_ad = (ad.title + ad.description).lower()
         return any(phrase.lower() in full_text_from_ad for phrase in phrases)
 
-    def is_viewed(self, ad: Item) -> bool:
+    def is_viewed(self, ad: Item, track_price_changes: bool = True) -> bool:
         """Проверяет, смотрели мы это или нет"""
-        return self.db_handler.record_exists(record_id=ad.id, price=ad.priceDetailed.value)
+        price_value = getattr(getattr(ad, "priceDetailed", None), "value", 0)
+        return self.db_handler.record_exists(
+            record_id=ad.id,
+            price=price_value,
+            track_price_changes=track_price_changes,
+        )
 
     @staticmethod
     def _is_recent(timestamp_ms: int, max_age_seconds: int) -> bool:
@@ -492,14 +526,13 @@ class AvitoParse:
     def __get_file_title(self) -> str:
         """Определяет название файла"""
         title_file = 'all'
-        if getattr(self.config, "queries", None):
-            title_file = "-".join(list(map(str.lower, self.config.queries)))
-            if len(title_file) > 50:
-                title_file = title_file[:50]
+        if getattr(self.config, "searches", None):
+            parts = [self._slugify(search.text, fallback=f"query-{idx + 1}") for idx, search in enumerate(self.config.searches)]
+            title_file = "-".join(parts)[:50] or "searches"
+        elif getattr(self.config, "queries", None):
+            title_file = "-".join(self._slugify(q) for q in self.config.queries)[:50]
         elif self.config.keys_word_white_list:
-            title_file = "-".join(list(map(str.lower, self.config.keys_word_white_list)))
-            if len(title_file) > 50:
-                title_file = title_file[:50]
+            title_file = "-".join(self._slugify(word) for word in self.config.keys_word_white_list)[:50]
 
         return str(self.result_dir / f"{title_file}.xlsx")
 
@@ -516,6 +549,19 @@ class AvitoParse:
             logger.info(f"{err} — сохраняем в {fallback}")
             return fallback
 
+    def _resolve_db_path(self) -> Path:
+        default = Path(__file__).resolve().parent / "database.db"
+        try:
+            default.touch(exist_ok=True)
+            if not os.access(default, os.W_OK | os.R_OK):
+                raise PermissionError("Нет прав на запись в database.db")
+            return default
+        except PermissionError as err:
+            fallback = Path(tempfile.gettempdir()) / "avito_parser_database.db"
+            fallback.touch(exist_ok=True)
+            logger.info(f"{err} — используем {fallback}")
+            return fallback
+
     def _resolve_cookies_path(self) -> Path:
         default = Path(__file__).resolve().parent / "cookies.json"
         try:
@@ -526,6 +572,44 @@ class AvitoParse:
             fallback.parent.mkdir(parents=True, exist_ok=True)
             logger.info(f"Используем {fallback} для cookies из-за прав доступа")
             return fallback
+
+    def _single_file_path(self, index: int, search_meta: SearchQuery | None) -> str:
+        name = self._slugify(search_meta.text) if search_meta else f"link-{index + 1}"
+        return str(self.result_dir / f"{name}.xlsx")
+
+    @staticmethod
+    def _slugify(value: str | None, fallback: str = "query") -> str:
+        if not value:
+            return fallback
+        slug = re.sub(r"[^a-z0-9]+", "-", value.lower()).strip("-")
+        slug = slug or fallback
+        return slug[:50]
+
+    def _get_active_price_bounds(self) -> tuple[Optional[int], Optional[int]]:
+        min_price = None
+        max_price = None
+        if self.active_search:
+            if self.active_search.min_price is not None:
+                min_price = self.active_search.min_price
+            if self.active_search.max_price is not None:
+                max_price = self.active_search.max_price
+        if min_price is None and self.config.min_price:
+            min_price = self.config.min_price
+        if max_price is None and self.config.max_price and self.config.max_price < 999_999_999:
+            max_price = self.config.max_price
+        return min_price, max_price
+
+    def _active_delivery_mode(self) -> str:
+        if self.active_search and self.active_search.delivery:
+            return self.active_search.delivery
+        if self.config.delivery_only:
+            return "delivery_only"
+        return "any"
+
+    def _should_track_price_changes(self) -> bool:
+        if self.active_search and self.active_search.track_price_changes is not None:
+            return self.active_search.track_price_changes
+        return True
 
     def __save_data(self, ads: list[Item]) -> None:
         """Сохраняет результат в файл keyword*.xlsx и в БД"""
@@ -559,27 +643,54 @@ class AvitoParse:
             logger.error(f"Не смог сформировать ссылку на следующую страницу для {url}. Ошибка: {err}")
 
     # формирования ссылок по запросу 
-    def _resolve_input_links(self) -> list[str]:
-        links: list[str] = []
+    def _resolve_input_links(self) -> list[tuple[SearchQuery | None, str]]:
+        links: list[tuple[SearchQuery | None, str]] = []
+        searches = getattr(self.config, "searches", None) or []
+        if searches:
+            for search in searches:
+                search_url = self._build_search_url(search)
+                logger.info(f"Сформирована поисковая ссылка для запроса '{search.text}': {search_url}")
+                links.append((search, search_url))
+            return links
+
         queries = getattr(self.config, "queries", None) or []
-        if queries:
-            for q in queries:
-                search_url = self._build_search_url(q)
-                logger.info(f"Сформирована поисковая ссылка для запроса '{q}': {search_url}")
-                links.append(search_url)
-        else:
-            links = list(self.config.urls or [])
-        return links
+        for q in queries:
+            q = (q or "").strip()
+            if not q:
+                continue
+            search_stub = SearchQuery(text=q)
+            search_url = self._build_search_url(search_stub)
+            logger.info(f"Сформирована поисковая ссылка для запроса '{q}': {search_url}")
+            links.append((search_stub, search_url))
 
-    def _build_search_url(self, query: str) -> str:
-        """
-        Формат: https://www.avito.ru/{region_slug|all}?q=<query>[&s=104][&p=1]
-        """
-        region = (self.config.region_slug or "all").strip("/")
-        base = f"https://www.avito.ru/{region}"
+        if links:
+            return links
 
-        params_items = [("cd", 1), ("q", query.lower())]
-        if getattr(self.config, "sort_new", False):
+        return [(None, url) for url in (self.config.urls or [])]
+
+    def _build_search_url(self, search: SearchQuery) -> str:
+        region_key = getattr(search, "region", "all") or "all"
+        region_slug = REGION_URL_MAP.get(region_key, region_key) or "all"
+        base = f"https://www.avito.ru/{region_slug}"
+
+        params_items: list[tuple[str, str | int]] = [("cd", 1), ("q", search.text.lower())]
+
+        min_price = search.min_price if search.min_price is not None else (self.config.min_price or None)
+        max_price = search.max_price if search.max_price is not None else (
+            self.config.max_price if self.config.max_price and self.config.max_price < 999_999_999 else None
+        )
+        if min_price:
+            params_items.append(("pmin", min_price))
+        if max_price:
+            params_items.append(("pmax", max_price))
+
+        if search.delivery == "delivery_only":
+            params_items.append(("d", 1))
+
+        sort_flag = search.sort_new
+        if sort_flag is None:
+            sort_flag = self.config.sort_new
+        if sort_flag:
             params_items.append(("s", 104))
 
         query_str = urlencode(params_items, doseq=True)

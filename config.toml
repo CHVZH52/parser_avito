@@ -6,13 +6,15 @@ tg_chat_id = [
 queries = [
     "Pioneer DDJ FLX4"
 ]
-# регио, если пусто, то all
+# Приоритетная настройка: параметризованные фильтры
+searches = [
+    { text = "Pioneer DDJ FLX4", region = "mo", min_price = 100, max_price = 120000, delivery = "delivery_only", sort_new = true, track_price_changes = true },
+    { text = "iPhone 16 Pro", region = "moscow_mo", min_price = 50000, max_price = 180000, delivery = "any", track_price_changes = false }
+]
+
+# Для обратной совместимости (если searches не заполнен)
 region_slug = ""
-
-# Сортировать по новым (добавляет s=104 в ссылку)
 sort_new = false
-
-# Только объявления с доставкой 
 delivery_only = false
 
 urls = [

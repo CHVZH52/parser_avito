@@ -25,45 +25,68 @@ class SQLiteDBHandler:
             cursor.execute(
                 """
                 CREATE TABLE IF NOT EXISTS viewed (
-                    id INTEGER,
+                    id INTEGER PRIMARY KEY,
                     price INTEGER
                 )
                 """
+            )
+            cursor.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_viewed_id ON viewed(id)"
             )
             conn.commit()
 
     def add_record(self, ad: Item):
         """Добавляет новую запись в таблицу viewed."""
-
+        value = self._extract_price(ad)
         with sqlite3.connect(self.db_name) as conn:
             cursor = conn.cursor()
             cursor.execute(
-                "INSERT INTO viewed (id, price) VALUES (?, ?)",
-                (ad.id, ad.priceDetailed.value),
+                """
+                INSERT INTO viewed (id, price)
+                VALUES (?, ?)
+                ON CONFLICT(id) DO UPDATE SET price = excluded.price
+                """,
+                (ad.id, value),
             )
             conn.commit()
 
     def add_record_from_page(self, ads: list[Item]):
         """Добавляет несколько записей в таблицу viewed."""
-        records = [(ad.id, ad.priceDetailed.value) for ad in ads]
+        records = [(ad.id, self._extract_price(ad)) for ad in ads if ad.id]
 
         with sqlite3.connect(self.db_name) as conn:
             cursor = conn.cursor()
             cursor.executemany(
                 """
-                INSERT OR REPLACE INTO viewed (id, price)
+                INSERT INTO viewed (id, price)
                 VALUES (?, ?)
+                ON CONFLICT(id) DO UPDATE SET price = excluded.price
                 """,
                 records,
             )
             conn.commit()
 
-    def record_exists(self, record_id, price):
-        """Проверяет, существует ли запись с заданными id и price."""
+    def record_exists(self, record_id, price, track_price_changes: bool = True):
+        """Проверяет, существует ли запись с заданными параметрами."""
+        if record_id is None:
+            return False
         with sqlite3.connect(self.db_name) as conn:
             cursor = conn.cursor()
-            cursor.execute(
-                "SELECT 1 FROM viewed WHERE id = ? AND price = ?",
-                (record_id, price),
-            )
+            if track_price_changes:
+                cursor.execute(
+                    "SELECT 1 FROM viewed WHERE id = ? AND price = ?",
+                    (record_id, price),
+                )
+            else:
+                cursor.execute(
+                    "SELECT 1 FROM viewed WHERE id = ?",
+                    (record_id,),
+                )
             return cursor.fetchone() is not None
+
+    @staticmethod
+    def _extract_price(ad: Item) -> int:
+        try:
+            return int(ad.priceDetailed.value)
+        except Exception:
+            return 0
