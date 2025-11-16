@@ -61,3 +61,9 @@ class AvitoConfig:
     parse_views: bool = False
     save_xlsx: bool = True
     searches: List[SearchQuery] = field(default_factory=list)
+    chat_owner: Optional[str] = None
+    filter_id: Optional[int] = None
+    filter_title: Optional[str] = None
+    filter_interval_seconds: Optional[int] = None
+    export_user_id: Optional[str] = None
+    skip_first_notifications: bool = False

@@ -147,6 +147,10 @@ class Item(BaseModel):
     isPromotion: bool = False
     total_views: int | None = None
     today_views: int | None = None
+    price_change_from: Optional[int] = None
+    filter_title: Optional[str] = None
+    filter_region_label: Optional[str] = None
+    filter_interval_seconds: Optional[int] = None
 
 
 class ItemsResponse(BaseModel):

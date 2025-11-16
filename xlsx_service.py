@@ -1,4 +1,5 @@
 import os
+from pathlib import Path
 from openpyxl import Workbook, load_workbook
 from threading import Lock
 from datetime import datetime
@@ -14,7 +15,7 @@ class XLSXHandler:
 
     def _initialize(self, file_name):
         self.file_name = file_name
-        os.makedirs("result", exist_ok=True)
+        Path(self.file_name).parent.mkdir(parents=True, exist_ok=True)
         if not os.path.exists(self.file_name):
             self._create_file()
 
@@ -23,6 +24,8 @@ class XLSXHandler:
         sheet = workbook.active
         sheet.title = "Data"
         sheet.append([
+            "Фильтр",
+            "Регион",
             "Название",
             "Цена",
             "URL",
@@ -36,6 +39,7 @@ class XLSXHandler:
             "Поднято",
             "Просмотры (всего)",
             "Просмотры (сегодня)",
+            "Интервал (сек)",
         ])
         workbook.save(self.file_name)
 
@@ -68,6 +72,8 @@ class XLSXHandler:
         sheet = workbook.active
 
         def get_largest_image_url(img):
+            if not hasattr(img, "root"):
+                return ""
             best_key = max(
                 img.root.keys(),
                 key=lambda k: int(k.split("x")[0]) * int(k.split("x")[1])
@@ -75,9 +81,15 @@ class XLSXHandler:
             return str(img.root[best_key])
 
         for ad in ads:
-            images_urls = [get_largest_image_url(img) for img in ad.images]
+            images = getattr(ad, "images", []) or []
+            images_urls = [get_largest_image_url(img) for img in images if getattr(img, "root", None)]
+            filter_name = getattr(ad, "filter_title", "") or ""
+            region_label = getattr(ad, "filter_region_label", "") or (ad.location.name if ad.location else "")
+            interval = getattr(ad, "filter_interval_seconds", None)
 
             row = [
+                filter_name,
+                region_label,
                 ad.title,
                 ad.priceDetailed.value,
                 f"https://www.avito.ru/{ad.urlPath}",
@@ -90,11 +102,10 @@ class XLSXHandler:
                 ";".join(images_urls),
                 "Да" if ad.isPromotion else "Нет",
                 ad.total_views if ad.total_views is not None else "",
-                ad.today_views if ad.today_views is not None else ""
+                ad.today_views if ad.today_views is not None else "",
+                interval if interval is not None else "",
             ]
             sheet.append(row)
 
         workbook.save(self.file_name)
-
-
 

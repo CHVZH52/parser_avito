@@ -1,38 +1,84 @@
 import asyncio
 import os
+import re
 from typing import Optional
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.enums import ParseMode
-from aiohttp import ClientTimeout
 from aiogram.filters import CommandStart, Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
+    BotCommand,
     CallbackQuery,
+    FSInputFile,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
-    KeyboardButton,
     Message,
-    ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
 )
 
 from pathlib import Path
 
-from load_config import _load_dotenv_simple
-from user_filters import UserFiltersStorage, UserProfile
+from load_config import _load_dotenv_simple, _parse_chat_ids
+from user_filters import (
+    MAX_INTERVAL_SECONDS,
+    MIN_INTERVAL_SECONDS,
+    DEFAULT_INTERVAL_SECONDS,
+    UserFiltersStorage,
+    UserProfile,
+)
+from paths_helper import user_xlsx_path
 
 storage = UserFiltersStorage()
+START_STICKER_ID = "CAACAgIAAxkBAAEIB0Zk3u7P5AnbcW2CYwiVdc0GqORdzAACnRcAAnlc4Ub1Z4VHKakiOTQE"
+SUCCESS_STICKER_ID = "CAACAgIAAxkBAAEIB0hk3vZPtruzWIEksIB0wbn5omfQUAACUxAAAv1p2Ep-jMxDPZWSQjQE"
+HELP_STICKER_ID = "CAACAgIAAxkBAAEIB1Zk4A7WhpnwsnRwJhi3F7S-MUz46QACyB0AAo5buUtxB4ezgmO0hDQE"
+EXPORT_HINT = (
+    "Готово! Как только я закончу проверять указанные запросы с твоими фильтрами, пришлю свежий XLSX."
+    "\nЕсли это первый запуск, дождись окончания цикла — после него появятся данные."
+)
+HELP_TEXT = (
+    "💗 *Как пользоваться ботом*\n"
+    "1. Нажми *«Добавить запрос»* и перечисли один или несколько поисковых запросов (например, `Pioneer DDJ FLX4`).\n"
+    "2. Затем я предложу настроить фильтр: регион, цены, доставку, интервал проверки в секундах.\n"
+    "3. Получай пуши с розовыми сердечками, скачивай XLSX в любой момент.\n"
+    "4. Кнопки в меню ведут по шагам, а если что — пишите мне, может чем помогу 💖"
+)
 
-MENU_KB = ReplyKeyboardMarkup(
-    keyboard=[
-        [KeyboardButton(text="Добавить фильтр")],
-        [KeyboardButton(text="Мои фильтры")],
-        [KeyboardButton(text="Настройки")],
-    ],
-    resize_keyboard=True,
+ADD_QUERY_LABEL = "Добавить запрос"
+MY_QUERIES_LABEL = "Мои запросы"
+SETTINGS_LABEL = "Настройки"
+XLSX_LABEL = "Скачать XLSX"
+HELP_LABEL = "Помощь"
+
+MENU_KB = ReplyKeyboardRemove()
+
+def get_allowed_chat_ids() -> set[int]:
+    env_value = os.getenv("TG_CHAT_IDS") or os.getenv("TG_CHAT_ID")
+    if not env_value:
+        return set()
+    parsed = _parse_chat_ids(env_value)
+    allowed: set[int] = set()
+    for item in parsed:
+        try:
+            allowed.add(int(item))
+        except ValueError:
+            continue
+    return allowed
+
+ALLOWED_CHAT_IDS = get_allowed_chat_ids()
+
+MAIN_MENU_INLINE = InlineKeyboardMarkup(
+    inline_keyboard=[
+        [InlineKeyboardButton(text="➕ Новый запрос", callback_data="menu:add")],
+        [InlineKeyboardButton(text="📋 Мои запросы", callback_data="menu:list")],
+        [InlineKeyboardButton(text="⚙️ Настройки фильтров", callback_data="menu:settings")],
+        [InlineKeyboardButton(text="📥 Скачать XLSX", callback_data="menu:xlsx")],
+        [InlineKeyboardButton(text="❓ Помощь", callback_data="menu:help")],
+    ]
 )
 
 REGION_LABELS = {
@@ -54,6 +100,7 @@ class FilterForm(StatesGroup):
     region = State()
     min_price = State()
     max_price = State()
+    interval = State()
     delivery = State()
     track = State()
 
@@ -85,44 +132,183 @@ def track_keyboard(selected: bool) -> InlineKeyboardMarkup:
     )
 
 
+async def send_main_menu(message: Message, text: Optional[str] = None):
+    hint = text or "Выбери действие из меню или просто жми на розовые кнопки ниже 💞"
+    await message.answer(hint, reply_markup=MAIN_MENU_INLINE)
+
+
+async def send_help(target_message: Message):
+    if HELP_STICKER_ID:
+        try:
+            await target_message.answer_sticker(HELP_STICKER_ID)
+        except Exception:
+            pass
+    await target_message.answer(HELP_TEXT, parse_mode=ParseMode.MARKDOWN)
+
+
+async def send_xlsx_file(target_message: Message):
+    path = user_xlsx_path(target_message.chat.id)
+    if not path.exists():
+        await target_message.answer(
+            "Пока нечего выгружать 💞 Добавь поисковый запрос и дождись первой проверки — тогда появится файл."
+        )
+        return
+    try:
+        doc = FSInputFile(str(path))
+        await target_message.answer_document(
+            document=doc,
+            caption="Последняя выгрузка по твоим фильтрам",
+        )
+    except Exception as err:
+        await target_message.answer(f"Не удалось отправить файл: {err}")
+
+
 async def start_cmd(message: Message, state: FSMContext):
+    if ALLOWED_CHAT_IDS and message.chat.id not in ALLOWED_CHAT_IDS:
+        await message.answer("👮 Доступ ограничен. Обратитесь к команде ЧВЖ для доступа.")
+        return
     await state.clear()
     storage.ensure_user(message.chat.id, message.from_user.username)
+    if START_STICKER_ID:
+        try:
+            await message.answer_sticker(START_STICKER_ID)
+        except Exception:
+            pass
     await message.answer(
-        "Привет! Я помогу настроить фильтры Авито. Используй меню ниже.",
+        "💗 Привет! Я помогу настроить поисковые запросы и фильтры Авито. Просто нажимай на кнопки — и всё будет розово‑понятно ✨",
         reply_markup=MENU_KB,
     )
+    await send_main_menu(message, "Главное меню:")
+
+
+async def menu_cmd(message: Message):
+    if ALLOWED_CHAT_IDS and message.chat.id not in ALLOWED_CHAT_IDS:
+        return
+    await send_main_menu(message, "Главное меню:")
+
+
+async def xlsx_cmd(message: Message):
+    if ALLOWED_CHAT_IDS and message.chat.id not in ALLOWED_CHAT_IDS:
+        return
+    await send_xlsx_file(message)
+
+
+async def help_cmd(message: Message):
+    if ALLOWED_CHAT_IDS and message.chat.id not in ALLOWED_CHAT_IDS:
+        return
+    await send_help(message)
+
+
+async def add_filter_cmd(message: Message, state: FSMContext):
+    if ALLOWED_CHAT_IDS and message.chat.id not in ALLOWED_CHAT_IDS:
+        return
+    await start_filter_wizard(message, state)
 
 
 async def cancel_cmd(message: Message, state: FSMContext):
     await state.clear()
     await message.answer("Действие отменено", reply_markup=MENU_KB)
+    await send_main_menu(message)
 
 
 async def add_filter_entry(message: Message, state: FSMContext):
-    if message.text != "Добавить фильтр":
+    if ALLOWED_CHAT_IDS and message.chat.id not in ALLOWED_CHAT_IDS:
         return
-    profile = storage.get_user_profile(message.chat.id)
+    if message.text != ADD_QUERY_LABEL:
+        return
+    await start_filter_wizard(message, state)
+
+
+async def download_xlsx(message: Message):
+    if ALLOWED_CHAT_IDS and message.chat.id not in ALLOWED_CHAT_IDS:
+        return
+    if message.text != XLSX_LABEL:
+        return
+    await send_xlsx_file(message)
+
+
+async def help_text(message: Message):
+    if ALLOWED_CHAT_IDS and message.chat.id not in ALLOWED_CHAT_IDS:
+        return
+    if message.text != HELP_LABEL:
+        return
+    await send_help(message)
+
+
+async def queries_cmd(message: Message):
+    if ALLOWED_CHAT_IDS and message.chat.id not in ALLOWED_CHAT_IDS:
+        return
+    await render_queries(message)
+
+
+async def settings_cmd(message: Message):
+    if ALLOWED_CHAT_IDS and message.chat.id not in ALLOWED_CHAT_IDS:
+        return
+    await render_settings(message)
+
+
+def get_bot_commands() -> list[BotCommand]:
+    return [
+        BotCommand(command="menu", description="Главное меню"),
+        BotCommand(command="add", description="Добавить запрос"),
+        BotCommand(command="filters", description="Мои запросы"),
+        BotCommand(command="settings", description="Настройки фильтров по умолчанию"),
+        BotCommand(command="xlsx", description="Скачать XLSX"),
+        BotCommand(command="help", description="Памятка по боту"),
+        BotCommand(command="cancel", description="Отменить текущее действие"),
+    ]
+
+
+async def start_filter_wizard(target: Message, state: FSMContext, profile: Optional[UserProfile] = None):
+    profile = profile or storage.get_user_profile(target.chat.id)
     await state.clear()
     await state.set_state(FilterForm.query)
     await state.update_data(mode="create", profile=profile.__dict__, sort_new=profile.default_sort_new)
-    await message.answer("Введи поисковый запрос")
+    await target.answer(
+        "🪄 Введи один или несколько поисковых запросов.\n"
+        "Можно через запятую или с новой строки (пример: `Pioneer DDJ FLX4, iPhone 16 Pro`).",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+
+async def menu_callback(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    await state.clear()
+    action = callback.data.split(":", 1)[1]
+    if action == "add":
+        profile = storage.get_user_profile(callback.from_user.id)
+        await start_filter_wizard(callback.message, state, profile=profile)
+    elif action == "xlsx":
+        await send_xlsx_file(callback.message)
+    elif action == "help":
+        await send_help(callback.message)
+        await send_main_menu(callback.message, "Нужно что-то ещё?")
+        return
+    else:
+        if action == "list":
+            await render_queries(callback.message)
+        else:
+            await render_settings(callback.message)
+        await send_main_menu(callback.message, "Нужно что-то ещё?")
 
 
 async def process_query(message: Message, state: FSMContext):
     data = await state.get_data()
     current_filter = data.get("edit_filter")
     text = message.text.strip()
+    queries: list[str]
     if data.get("mode") == "edit" and text == "-":
-        text = current_filter.get("text")
-    if not text:
-        await message.answer("Запрос не может быть пустым")
+        queries = [current_filter.get("text")]
+    else:
+        queries = _extract_queries(text)
+    if not queries:
+        await message.answer("Нужно указать хотя бы один поисковый запрос")
         return
-    await state.update_data(query=text)
+    await state.update_data(query=queries[0], queries=queries)
     profile = UserProfile(**data["profile"])
     selected = current_filter.get("region") if current_filter else profile.default_region
     await state.set_state(FilterForm.region)
-    await message.answer("Выбери регион", reply_markup=region_keyboard(selected, "wizard_region"))
+    await message.answer("🌍 Выбери регион поиска", reply_markup=region_keyboard(selected, "wizard_region"))
 
 
 async def process_region(callback: CallbackQuery, state: FSMContext):
@@ -130,7 +316,7 @@ async def process_region(callback: CallbackQuery, state: FSMContext):
     await state.update_data(region=value)
     await callback.answer()
     await state.set_state(FilterForm.min_price)
-    await callback.message.answer("Минимальная цена или '-' чтобы пропустить")
+    await callback.message.answer("💰 Минимальная цена или '-' если всё равно")
 
 
 def _parse_price(text: str, default: Optional[int] = None) -> Optional[int]:
@@ -143,6 +329,27 @@ def _parse_price(text: str, default: Optional[int] = None) -> Optional[int]:
     return None
 
 
+def _extract_queries(text: str) -> list[str]:
+    parts = re.split(r"[,\n]+", text)
+    queries: list[str] = []
+    for part in parts:
+        value = part.strip()
+        if value and value not in queries:
+            queries.append(value)
+    return queries
+
+
+def _parse_interval(text: str, default: Optional[int]) -> Optional[int]:
+    text = text.strip()
+    if text in {"-", ""}:
+        return default
+    if text.isdigit():
+        value = int(text)
+        if MIN_INTERVAL_SECONDS <= value <= MAX_INTERVAL_SECONDS:
+            return value
+    return None
+
+
 async def process_min_price(message: Message, state: FSMContext):
     data = await state.get_data()
     current = data.get("edit_filter", {}).get("min_price")
@@ -152,7 +359,7 @@ async def process_min_price(message: Message, state: FSMContext):
         return
     await state.update_data(min_price=value)
     await state.set_state(FilterForm.max_price)
-    await message.answer("Максимальная цена или '-' чтобы пропустить")
+    await message.answer("💰 Максимальная цена или '-' чтобы пропустить")
 
 
 async def process_max_price(message: Message, state: FSMContext):
@@ -163,14 +370,31 @@ async def process_max_price(message: Message, state: FSMContext):
         await message.answer("Нужно число или '-' для пропуска")
         return
     await state.update_data(max_price=value)
+    current_interval = data.get("edit_filter", {}).get("interval_seconds") or DEFAULT_INTERVAL_SECONDS
+    await state.set_state(FilterForm.interval)
+    await message.answer(
+        f"⏱ Как часто проверять? Напиши число в секундах от {MIN_INTERVAL_SECONDS} до {MAX_INTERVAL_SECONDS} "
+        f"или '-' чтобы оставить {current_interval} сек.",
+    )
+
+
+async def process_interval(message: Message, state: FSMContext):
+    data = await state.get_data()
+    current = data.get("edit_filter", {}).get("interval_seconds") or DEFAULT_INTERVAL_SECONDS
+    value = _parse_interval(message.text, current)
+    if value is None:
+        await message.answer(
+            f"Пожалуйста, число от {MIN_INTERVAL_SECONDS} до {MAX_INTERVAL_SECONDS} секунд или '-' чтобы оставить {current}."
+        )
+        return
+    await state.update_data(interval=value)
     profile = UserProfile(**data["profile"])
     current_delivery = data.get("edit_filter", {}).get("delivery") or profile.default_delivery
     await state.set_state(FilterForm.delivery)
     await message.answer(
-        "Выбери тип доставки",
+        "🚚 Выбери вариант доставки",
         reply_markup=delivery_keyboard(current_delivery, "wizard_delivery"),
     )
-
 
 async def process_delivery(callback: CallbackQuery, state: FSMContext):
     value = callback.data.split(":", 1)[1]
@@ -182,7 +406,7 @@ async def process_delivery(callback: CallbackQuery, state: FSMContext):
         profile = UserProfile(**data["profile"])
         current_track = profile.default_track_price
     await state.set_state(FilterForm.track)
-    await callback.message.answer("Отслеживать изменение цены?", reply_markup=track_keyboard(current_track))
+    await callback.message.answer("🔔 Отслеживать изменение цены?", reply_markup=track_keyboard(current_track))
 
 
 async def process_track(callback: CallbackQuery, state: FSMContext):
@@ -191,32 +415,51 @@ async def process_track(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
     data = await state.get_data()
     chat_id = callback.message.chat.id
+    interval_value = data.get("interval")
+    queries = data.get("queries") or [data.get("query")]
     if data.get("mode") == "edit":
         filt = data["edit_filter"]
+        interval_to_use = interval_value if interval_value is not None else filt.get("interval_seconds")
         storage.update_filter(
             filt["id"],
             chat_id=chat_id,
-            text=data.get("query", filt["text"]),
+            text=queries[0] if queries else filt["text"],
             region=data.get("region", filt["region"]),
             min_price=data.get("min_price", filt.get("min_price")),
             max_price=data.get("max_price", filt.get("max_price")),
             delivery=data.get("delivery", filt.get("delivery")),
             sort_new=filt.get("sort_new"),
             track_price_changes=track_value,
+            interval_seconds=interval_to_use,
         )
-        await callback.message.answer("Фильтр обновлён", reply_markup=MENU_KB)
+        await callback.message.answer("Параметры фильтра обновлены", reply_markup=MENU_KB)
     else:
-        storage.add_filter(
-            chat_id=chat_id,
-            text=data["query"],
-            region=data.get("region", "all"),
-            min_price=data.get("min_price"),
-            max_price=data.get("max_price"),
-            delivery=data.get("delivery", "any"),
-            sort_new=data.get("sort_new"),
-            track_price_changes=track_value,
+        interval_to_use = interval_value if interval_value is not None else DEFAULT_INTERVAL_SECONDS
+        created = 0
+        for query in queries:
+            storage.add_filter(
+                chat_id=chat_id,
+                text=query,
+                region=data.get("region", "all"),
+                min_price=data.get("min_price"),
+                max_price=data.get("max_price"),
+                delivery=data.get("delivery", "any"),
+                sort_new=data.get("sort_new"),
+                track_price_changes=track_value,
+                interval_seconds=interval_to_use,
+            )
+            created += 1
+        await callback.message.answer(
+            f"Добавлено поисковых запросов: {created}",
+            reply_markup=MENU_KB,
         )
-        await callback.message.answer("Фильтр сохранён", reply_markup=MENU_KB)
+        if SUCCESS_STICKER_ID:
+            try:
+                await callback.message.answer_sticker(SUCCESS_STICKER_ID)
+            except Exception:
+                pass
+    await callback.message.answer(EXPORT_HINT)
+    await send_main_menu(callback.message, "Готово! Что дальше?")
     await state.clear()
 
 
@@ -226,12 +469,14 @@ def format_filter(row) -> str:
     min_price = row["min_price"] if row["min_price"] is not None else "—"
     max_price = row["max_price"] if row["max_price"] is not None else "—"
     track = "Вкл" if row["track_price_changes"] else "Выкл"
+    interval = row["interval_seconds"] or DEFAULT_INTERVAL_SECONDS
     parts = [
-        f"*{row['text']}*",
-        f"Регион: {region}",
-        f"Цена: {min_price} — {max_price}",
-        f"Доставка: {delivery}",
-        f"Отслеживание цены: {track}",
+        f"🔎 Запрос: *{row['text']}*",
+        f"📍 Фильтр — регион: {region}",
+        f"💰 Фильтр — цена: {min_price} — {max_price}",
+        f"🚚 Фильтр — доставка: {delivery}",
+        f"🔔 Фильтр — отслеживание цены: {track}",
+        f"⏱ Фильтр — проверка каждые {interval} сек",
     ]
     return "\n".join(parts)
 
@@ -241,7 +486,7 @@ def filter_keyboard(row) -> InlineKeyboardMarkup:
     track_text = "Отслеживание цены: " + ("Выкл" if not row["track_price_changes"] else "Вкл")
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="Редактировать", callback_data=f"filter_edit:{row['id']}")],
+            [InlineKeyboardButton(text="Изменить фильтр", callback_data=f"filter_edit:{row['id']}")],
             [InlineKeyboardButton(text="Удалить", callback_data=f"filter_delete:{row['id']}")],
             [InlineKeyboardButton(text=delivery_text, callback_data=f"filter_delivery:{row['id']}")],
             [InlineKeyboardButton(text=track_text, callback_data=f"filter_track:{row['id']}")],
@@ -249,15 +494,19 @@ def filter_keyboard(row) -> InlineKeyboardMarkup:
     )
 
 
-async def show_filters(message: Message):
-    if message.text != "Мои фильтры":
+async def show_queries(message: Message):
+    if message.text != MY_QUERIES_LABEL:
         return
-    rows = storage.list_filters(message.chat.id)
+    await render_queries(message)
+
+
+async def render_queries(target: Message):
+    rows = storage.list_filters(target.chat.id)
     if not rows:
-        await message.answer("Ты пока не добавил фильтры. Нажми ‘Добавить фильтр’.")
+        await target.answer(f"Пока нет поисковых запросов 💗 Нажми «{ADD_QUERY_LABEL}» и мы быстро всё настроим.")
         return
     for row in rows:
-        await message.answer(
+        await target.answer(
             format_filter(row),
             reply_markup=filter_keyboard(row),
             parse_mode=ParseMode.MARKDOWN,
@@ -265,15 +514,20 @@ async def show_filters(message: Message):
 
 
 async def show_settings(message: Message):
-    if message.text != "Настройки":
+    if message.text != SETTINGS_LABEL:
         return
-    profile = storage.get_user_profile(message.chat.id)
+    await render_settings(message)
+
+
+async def render_settings(target: Message):
+    profile = storage.get_user_profile(target.chat.id)
     text = (
         "Настройки по умолчанию:\n"
         f"• Регион: {REGION_LABELS.get(profile.default_region, profile.default_region)}\n"
         f"• Доставка: {DELIVERY_LABELS.get(profile.default_delivery, profile.default_delivery)}\n"
         f"• Отслеживание цены: {'Вкл' if profile.default_track_price else 'Выкл'}\n"
-        f"• Сортировка по новым: {'Вкл' if profile.default_sort_new else 'Выкл'}"
+        f"• Сортировка по новым: {'Вкл' if profile.default_sort_new else 'Выкл'}\n"
+        "• Интервал настраивается для каждого добавляемого запроса"
     )
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
@@ -283,7 +537,7 @@ async def show_settings(message: Message):
             [InlineKeyboardButton(text="Переключить сортировку", callback_data="settings_sort")],
         ]
     )
-    await message.answer(text, reply_markup=kb)
+    await target.answer(text, reply_markup=kb)
 
 
 async def settings_region(callback: CallbackQuery):
@@ -330,7 +584,7 @@ async def filter_delete(callback: CallbackQuery):
     filter_id = int(callback.data.split(":", 1)[1])
     storage.delete_filter(filter_id, callback.message.chat.id)
     await callback.answer("Удалено")
-    await callback.message.edit_text("Фильтр удалён")
+    await callback.message.edit_text("Запрос удалён вместе с фильтром")
 
 
 async def filter_toggle_delivery(callback: CallbackQuery):
@@ -383,20 +637,30 @@ async def main():
     token = os.getenv("TG_BOT_TOKEN")
     if not token:
         raise RuntimeError("TG_BOT_TOKEN не задан")
-    session = AiohttpSession(timeout=ClientTimeout(total=30, sock_read=30, connect=10))
+    session = AiohttpSession(timeout=30)
     bot = Bot(token=token, default=DefaultBotProperties(parse_mode=ParseMode.MARKDOWN), session=session)
     dp = Dispatcher()
     dp.message.register(start_cmd, CommandStart())
     dp.message.register(cancel_cmd, Command("cancel"))
-    dp.message.register(add_filter_entry, F.text == "Добавить фильтр")
-    dp.message.register(show_filters, F.text == "Мои фильтры")
-    dp.message.register(show_settings, F.text == "Настройки")
+    dp.message.register(menu_cmd, Command("menu"))
+    dp.message.register(add_filter_cmd, Command("add"))
+    dp.message.register(queries_cmd, Command("filters"))
+    dp.message.register(settings_cmd, Command("settings"))
+    dp.message.register(xlsx_cmd, Command("xlsx"))
+    dp.message.register(help_cmd, Command("help"))
+    dp.message.register(add_filter_entry, F.text == ADD_QUERY_LABEL)
+    dp.message.register(show_queries, F.text == MY_QUERIES_LABEL)
+    dp.message.register(show_settings, F.text == SETTINGS_LABEL)
+    dp.message.register(download_xlsx, F.text == XLSX_LABEL)
+    dp.message.register(help_text, F.text == HELP_LABEL)
     dp.message.register(process_query, FilterForm.query)
+    dp.message.register(process_interval, FilterForm.interval)
     dp.callback_query.register(process_region, FilterForm.region, F.data.startswith("wizard_region:"))
     dp.message.register(process_min_price, FilterForm.min_price)
     dp.message.register(process_max_price, FilterForm.max_price)
     dp.callback_query.register(process_delivery, FilterForm.delivery, F.data.startswith("wizard_delivery:"))
     dp.callback_query.register(process_track, FilterForm.track, F.data.startswith("wizard_track:"))
+    dp.callback_query.register(menu_callback, F.data.startswith("menu:"))
     dp.callback_query.register(settings_region, F.data == "settings_region")
     dp.callback_query.register(settings_delivery, F.data == "settings_delivery")
     dp.callback_query.register(settings_region_value, F.data.startswith("settings_region_value:"))
@@ -406,6 +670,7 @@ async def main():
     dp.callback_query.register(filter_toggle_delivery, F.data.startswith("filter_delivery:"))
     dp.callback_query.register(filter_toggle_track, F.data.startswith("filter_track:"))
     dp.callback_query.register(filter_edit, F.data.startswith("filter_edit:"))
+    await bot.set_my_commands(get_bot_commands())
     await dp.start_polling(bot)
 
 

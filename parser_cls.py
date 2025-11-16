@@ -30,6 +30,7 @@ from models import ItemsResponse, Item
 from tg_sender import SendAdToTg
 from version import VERSION
 from xlsx_service import XLSXHandler
+from paths_helper import user_xlsx_path
 
 DEBUG_MODE = False
 
@@ -39,6 +40,16 @@ REGION_URL_MAP = {
     "moscow_mo": "moskva_i_mo",
     "mo": "moskovskaya_oblast",
     "moscow_region": "moskovskaya_oblast",
+}
+
+REGION_SLUG_TO_KEY = {slug: key for key, slug in REGION_URL_MAP.items()}
+
+REGION_LABELS = {
+    "all": "Все регионы",
+    "moscow": "Москва",
+    "moscow_mo": "Москва и МО",
+    "mo": "Московская область",
+    "moscow_region": "Московская область",
 }
 
 def _configure_logging() -> None:
@@ -77,7 +88,11 @@ class AvitoParse:
         self.result_dir = self._ensure_result_dir()
         self.cookies_file = self._resolve_cookies_path()
         self.db_path = self._resolve_db_path()
-        self.chat_owner = self._resolve_chat_owner()
+        self.chat_owner = getattr(self.config, "chat_owner", None) or self._resolve_chat_owner()
+        self.filter_title = getattr(self.config, "filter_title", None)
+        self.filter_interval_seconds = getattr(self.config, "filter_interval_seconds", None)
+        self.skip_initial_notifications = getattr(self.config, "skip_first_notifications", False)
+        self.export_user_id = getattr(self.config, "export_user_id", None)
         self.db_handler = SQLiteDBHandler(db_name=str(self.db_path))
         self.tg_handler = self.get_tg_handler()
         self.xlsx_handler = XLSXHandler(self.__get_file_title())
@@ -87,6 +102,8 @@ class AvitoParse:
         self.headers = HEADERS
         self.good_request_count = 0
         self.bad_request_count = 0
+        self.notifications_ready = self._initial_notifications_ready()
+        self._initial_skip_logged = False
 
         log_config(config=self.config, version=VERSION)
 
@@ -98,8 +115,22 @@ class AvitoParse:
     def _send_to_tg(self, ads: list[Item]) -> None:
         if not self.tg_handler:
             return
+        if not self.notifications_ready:
+            if not self._initial_skip_logged:
+                logger.info("Пропускаю уведомления для первого запуска (%s)", self.chat_owner)
+                self._initial_skip_logged = True
+            return
         for ad in ads:
+            self._annotate_ad(ad)
             self.tg_handler.send_to_tg(ad=ad)
+
+    def _annotate_ad(self, ad: Item) -> None:
+        if hasattr(ad, "filter_title"):
+            ad.filter_title = self.filter_title or (self.active_search.text if self.active_search else None)
+        if hasattr(ad, "filter_interval_seconds"):
+            ad.filter_interval_seconds = self.filter_interval_seconds
+        if hasattr(ad, "filter_region_label"):
+            ad.filter_region_label = self._current_region_label()
 
     def get_proxy_obj(self) -> Proxy | None:
         if all([self.config.proxy_string, self.config.proxy_change_url]):
@@ -185,8 +216,7 @@ class AvitoParse:
                     self.bad_request_count += 1
                     self.session = requests.Session()
                     self.change_ip()
-                    if attempt >= 3:
-                        self.cookies = self.get_cookies()
+                    self.cookies = self.get_cookies()
                     raise requests.RequestsError(f"Слишком много запросов: {response.status_code}")
                 if response.status_code in [403, 302]:
                     self.cookies = self.get_cookies()
@@ -512,12 +542,18 @@ class AvitoParse:
 
     def is_viewed(self, ad: Item, track_price_changes: bool = True) -> bool:
         """Проверяет, смотрели мы это или нет"""
-        price_value = getattr(getattr(ad, "priceDetailed", None), "value", 0)
-        return self.db_handler.record_exists(
-            record_id=ad.id,
-            price=price_value,
-            track_price_changes=track_price_changes,
-        )
+        try:
+            price_value = int(getattr(getattr(ad, "priceDetailed", None), "value", 0))
+        except Exception:
+            price_value = 0
+        previous_price = self.db_handler.get_price(record_id=ad.id, chat_id=self.chat_owner)
+        if previous_price is None:
+            return False
+        if track_price_changes and previous_price != price_value:
+            if hasattr(ad, "price_change_from"):
+                ad.price_change_from = previous_price
+            return False
+        return True
 
     @staticmethod
     def _is_recent(timestamp_ms: int, max_age_seconds: int) -> bool:
@@ -527,6 +563,12 @@ class AvitoParse:
 
     def __get_file_title(self) -> str:
         """Определяет название файла"""
+        user_id = self.export_user_id or self._primary_user_chat_id()
+        if user_id:
+            user_path = user_xlsx_path(user_id, base_dir=self.result_dir)
+            user_path.parent.mkdir(parents=True, exist_ok=True)
+            return str(user_path)
+
         title_file = 'all'
         if getattr(self.config, "searches", None):
             parts = [self._slugify(search.text, fallback=f"query-{idx + 1}") for idx, search in enumerate(self.config.searches)]
@@ -570,6 +612,23 @@ class AvitoParse:
             return str(chats[0])
         return "global"
 
+    def _initial_notifications_ready(self) -> bool:
+        chat_owner = getattr(self, "chat_owner", None)
+        if not self.skip_initial_notifications:
+            return True
+        if not chat_owner or chat_owner == "global":
+            return True
+        try:
+            return self.db_handler.has_history(chat_owner)
+        except Exception:
+            return True
+
+    def _primary_user_chat_id(self) -> str | None:
+        chats = self.config.tg_chat_id or []
+        if chats:
+            return str(chats[0])
+        return None
+
     def _resolve_cookies_path(self) -> Path:
         default = Path(__file__).resolve().parent / "cookies.json"
         try:
@@ -607,6 +666,17 @@ class AvitoParse:
             max_price = self.config.max_price
         return min_price, max_price
 
+    def _current_region_label(self) -> str:
+        if self.active_search and getattr(self.active_search, "region", None):
+            key = self.active_search.region
+        else:
+            base_slug = getattr(self.config, "region_slug", None)
+            if base_slug:
+                key = REGION_SLUG_TO_KEY.get(base_slug, "all")
+            else:
+                key = "all"
+        return REGION_LABELS.get(key, "Все регионы")
+
     def _active_delivery_mode(self) -> str:
         if self.active_search and self.active_search.delivery:
             return self.active_search.delivery
@@ -630,6 +700,8 @@ class AvitoParse:
         """Сохраняет просмотренные объявления"""
         try:
             self.db_handler.add_record_from_page(ads=ads, chat_id=chat_owner)
+            if not self.notifications_ready and chat_owner not in {None, "global"}:
+                self.notifications_ready = True
         except Exception as err:
             logger.info(f"При сохранении в БД ошибка {err}")
 
@@ -718,6 +790,7 @@ def build_user_configs(base_config: AvitoConfig, storage: UserFiltersStorage) ->
         cfg.searches = searches
         cfg.queries = [search.text for search in searches]
         cfg.tg_chat_id = [str(chat_id)]
+        cfg.chat_owner = str(chat_id)
         configs.append(cfg)
 
     if not configs:

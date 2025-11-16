@@ -87,7 +87,7 @@ class SQLiteDBHandler:
             conn.commit()
 
     def record_exists(self, record_id, price, chat_id: str = "global", track_price_changes: bool = True):
-        """Проверяет, существует ли запись с заданными параметрами."""
+        """Проверяет, существует ли запись с заданными параметрами"""
         if record_id is None:
             return False
         with sqlite3.connect(self.db_name) as conn:
@@ -103,6 +103,29 @@ class SQLiteDBHandler:
                     (chat_id, record_id),
                 )
             return cursor.fetchone() is not None
+
+    def has_history(self, chat_id: str = "global") -> bool:
+        with sqlite3.connect(self.db_name) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT 1 FROM viewed WHERE chat_id = ? LIMIT 1",
+                (chat_id,),
+            )
+            return cursor.fetchone() is not None
+
+    def get_price(self, record_id, chat_id: str = "global") -> int | None:
+        if record_id is None:
+            return None
+        with sqlite3.connect(self.db_name) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT price FROM viewed WHERE chat_id = ? AND id = ?",
+                (chat_id, record_id),
+            )
+            row = cursor.fetchone()
+            if row is None:
+                return None
+            return row[0]
 
     @staticmethod
     def _extract_price(ad: Item) -> int:

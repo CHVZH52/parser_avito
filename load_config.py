@@ -1,4 +1,5 @@
 import os
+import re
 from pathlib import Path
 
 import tomli as tomllib
@@ -88,9 +89,17 @@ def load_avito_config(path: str = "config.toml") -> AvitoConfig:
 
     _load_dotenv_simple(Path(path).resolve().parent)
 
-    env_token = os.getenv("AVITO_TG_TOKEN") or os.getenv("TG_TOKEN")
+    env_token = os.getenv("AVITO_TG_TOKEN") or os.getenv("TG_TOKEN") or os.getenv("TG_BOT_TOKEN")
     if env_token:
         cfg.tg_token = env_token
+    env_chat_ids = os.getenv("TG_CHAT_IDS") or os.getenv("TG_CHAT_ID")
+    if env_chat_ids:
+        parsed_chat_ids = _parse_chat_ids(env_chat_ids)
+        if parsed_chat_ids:
+            cfg.tg_chat_id = parsed_chat_ids
+    env_skip = os.getenv("SKIP_FIRST_NOTIFICATIONS")
+    if env_skip is not None:
+        cfg.skip_first_notifications = _to_bool(env_skip, default=cfg.skip_first_notifications)
 
     return cfg
 
@@ -158,3 +167,13 @@ def _to_bool(value, default=None):
         if val in {"0", "false", "no", "off"}:
             return False
     return bool(value)
+
+
+def _parse_chat_ids(value: str) -> list[str]:
+    parts = re.split(r"[\n,;]+", value)
+    cleaned = []
+    for part in parts:
+        candidate = part.strip()
+        if candidate:
+            cleaned.append(candidate)
+    return cleaned

@@ -1,11 +1,11 @@
 [avito]
 tg_chat_id = [
-    "639675651",
 ]
 
 queries = [
     "Pioneer DDJ FLX4"
 ]
+
 # Приоритетная настройка: параметризованные фильтры
 # region: all | moscow | mo | moscow_mo
 searches = [

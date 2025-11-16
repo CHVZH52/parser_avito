@@ -5,6 +5,10 @@ from typing import Optional, Dict, List
 
 from dto import SearchQuery
 
+DEFAULT_INTERVAL_SECONDS = 30
+MIN_INTERVAL_SECONDS = 2
+MAX_INTERVAL_SECONDS = 60
+
 
 @dataclass
 class UserProfile:
@@ -58,7 +62,7 @@ class UserFiltersStorage:
                 """
             )
             cursor.execute(
-                """
+                f"""
                 CREATE TABLE IF NOT EXISTS filters (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     chat_id INTEGER NOT NULL,
@@ -69,11 +73,40 @@ class UserFiltersStorage:
                     delivery TEXT DEFAULT 'any',
                     sort_new INTEGER,
                     track_price_changes INTEGER DEFAULT 1,
+                    interval_minutes INTEGER DEFAULT {DEFAULT_INTERVAL_SECONDS},
                     FOREIGN KEY(chat_id) REFERENCES users(chat_id) ON DELETE CASCADE
                 )
                 """
             )
+            self._ensure_column(
+                conn,
+                "filters",
+                "interval_minutes",
+                f"INTEGER DEFAULT {DEFAULT_INTERVAL_SECONDS}",
+            )
+            self._ensure_interval_seconds(conn)
             conn.commit()
+
+    @staticmethod
+    def _ensure_column(conn, table: str, column: str, definition: str) -> None:
+        columns = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+        if column not in columns:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
+    def _ensure_interval_seconds(self, conn) -> None:
+        info = conn.execute("PRAGMA table_info(filters)").fetchall()
+        columns = {row["name"] for row in info}
+        if "interval_seconds" not in columns:
+            conn.execute(
+                f"ALTER TABLE filters ADD COLUMN interval_seconds INTEGER DEFAULT {DEFAULT_INTERVAL_SECONDS}"
+            )
+            conn.execute(
+                "UPDATE filters SET interval_seconds = interval_minutes * 60 "
+                "WHERE interval_minutes IS NOT NULL"
+            )
+        conn.execute(
+            f"UPDATE filters SET interval_seconds = {DEFAULT_INTERVAL_SECONDS} WHERE interval_seconds IS NULL"
+        )
 
     def ensure_user(self, chat_id: int, username: Optional[str] = None) -> None:
         with self._connect() as conn:
@@ -150,14 +183,17 @@ class UserFiltersStorage:
         delivery: str,
         sort_new: Optional[bool],
         track_price_changes: bool,
+        interval_seconds: Optional[int] = None,
     ) -> int:
         self.ensure_user(chat_id, None)
+        interval = interval_seconds if interval_seconds is not None else DEFAULT_INTERVAL_SECONDS
+        interval = max(MIN_INTERVAL_SECONDS, min(MAX_INTERVAL_SECONDS, interval))
         with self._connect() as conn:
             cursor = conn.cursor()
             cursor.execute(
                 """
-                INSERT INTO filters (chat_id, text, region, min_price, max_price, delivery, sort_new, track_price_changes)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO filters (chat_id, text, region, min_price, max_price, delivery, sort_new, track_price_changes, interval_seconds)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     chat_id,
@@ -168,6 +204,7 @@ class UserFiltersStorage:
                     delivery,
                     None if sort_new is None else int(sort_new),
                     int(track_price_changes),
+                    interval,
                 ),
             )
             conn.commit()
@@ -205,6 +242,13 @@ class UserFiltersStorage:
             updates.append(f"{key}=?")
             if key in {"sort_new", "track_price_changes"} and value is not None:
                 params.append(int(value))
+            elif key == "interval_seconds" and value is not None:
+                try:
+                    numeric = int(value)
+                except (TypeError, ValueError):
+                    numeric = DEFAULT_INTERVAL_SECONDS
+                numeric = max(MIN_INTERVAL_SECONDS, min(MAX_INTERVAL_SECONDS, numeric))
+                params.append(numeric)
             else:
                 params.append(value)
         if not updates:
@@ -251,3 +295,15 @@ class UserFiltersStorage:
             )
             result.setdefault(row["chat_id"], []).append(search)
         return result
+
+    def get_filters_for_scheduler(self) -> List[sqlite3.Row]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT filters.*, users.username
+                FROM filters
+                LEFT JOIN users ON filters.chat_id = users.chat_id
+                ORDER BY filters.id DESC
+                """
+            ).fetchall()
+        return rows

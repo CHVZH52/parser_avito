@@ -26,4 +26,4 @@ RUN python -m playwright install chromium
 
 COPY . /app
 
-CMD ["python", "parser_cls.py"]
+CMD ["python", "service_runner.py"]
