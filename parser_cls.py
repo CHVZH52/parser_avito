@@ -86,23 +86,23 @@ class AvitoParse:
         self.proxy_obj = self.get_proxy_obj()
         self.active_search = None
         self.result_dir = self._ensure_result_dir()
+        self.db_path = self._resolve_db_path()
+        self.db_handler = SQLiteDBHandler(db_name=str(self.db_path))
         self.chat_owner = getattr(self.config, "chat_owner", None) or self._resolve_chat_owner()
         self.filter_title = getattr(self.config, "filter_title", None)
         self.filter_interval_seconds = getattr(self.config, "filter_interval_seconds", None)
         self.skip_initial_notifications = getattr(self.config, "skip_first_notifications", False)
         self.export_user_id = getattr(self.config, "export_user_id", None)
         self.filters_storage = UserFiltersStorage()
-        self.filters_storage = UserFiltersStorage()
         self.cookies_file = self._resolve_cookies_path()
-        self.db_path = self._resolve_db_path()
         self.initial_summary_sent = getattr(self.config, "initial_summary_sent", False)
+        self._has_history_flag = self._has_history()
         self.initial_batch_mode = (
             not self.skip_initial_notifications
-            and not self.initial_summary_sent
+            and not (self.initial_summary_sent and self._has_history_flag)
             and self.chat_owner not in {None, "global"}
         )
         self.initial_batch_buffer: list[Item] = []
-        self.db_handler = SQLiteDBHandler(db_name=str(self.db_path))
         self.tg_handler = self.get_tg_handler()
         self.xlsx_handler = XLSXHandler(self.__get_file_title())
         self.stop_event = stop_event
@@ -164,6 +164,13 @@ class AvitoParse:
                 number = (idx - 1) * chunk_size + offset
                 lines.append(f"{number}. [{title_text}]({full_url}) — {price_text} ₽")
             lines.append("Дальше я буду присылать объявления по одному с фото и ссылкой.")
+            logger.info(
+                "Отправляю стартовый пакет %s/%s для запроса '%s' (%s объявлений)",
+                idx,
+                len(chunks),
+                title,
+                len(chunk),
+            )
             self.tg_handler.send_to_tg(msg="\n".join(lines))
         self.initial_summary_sent = True
         chat_value = self.export_user_id
@@ -762,8 +769,6 @@ class AvitoParse:
             self.db_handler.add_record_from_page(ads=ads, chat_id=chat_owner)
             if self.skip_initial_notifications and not self.notifications_ready and chat_owner not in {None, "global"}:
                 self.notifications_ready = True
-            if self.initial_batch_mode:
-                self.initial_batch_mode = False
         except Exception as err:
             logger.info(f"При сохранении в БД ошибка {err}")
 
