@@ -10,7 +10,6 @@ from dto import AvitoConfig, SearchQuery
 from parser_cls import AvitoParse
 from user_filters import (
     DEFAULT_INTERVAL_SECONDS,
-    MAX_INTERVAL_SECONDS,
     MIN_INTERVAL_SECONDS,
     UserFiltersStorage,
 )
@@ -21,7 +20,7 @@ def _clamp_interval(value: Optional[int]) -> int:
         seconds = int(value)
     except (TypeError, ValueError):
         seconds = DEFAULT_INTERVAL_SECONDS
-    return max(MIN_INTERVAL_SECONDS, min(MAX_INTERVAL_SECONDS, seconds))
+    return max(MIN_INTERVAL_SECONDS, seconds)
 
 
 def _build_search(row) -> SearchQuery:

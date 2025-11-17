@@ -93,6 +93,10 @@ class AvitoParse:
         self.filter_interval_seconds = getattr(self.config, "filter_interval_seconds", None)
         self.skip_initial_notifications = getattr(self.config, "skip_first_notifications", False)
         self.export_user_id = getattr(self.config, "export_user_id", None)
+        self._initial_has_history = self._has_history()
+        self.initial_batch_mode = (not self.skip_initial_notifications and not self._initial_has_history
+                                   and self.chat_owner not in {None, "global"})
+        self._initial_batch_sent = False
         self.db_handler = SQLiteDBHandler(db_name=str(self.db_path))
         self.tg_handler = self.get_tg_handler()
         self.xlsx_handler = XLSXHandler(self.__get_file_title())
@@ -115,6 +119,11 @@ class AvitoParse:
     def _send_to_tg(self, ads: list[Item]) -> None:
         if not self.tg_handler:
             return
+        if self.initial_batch_mode and not self._initial_batch_sent:
+            self._send_initial_batch_summary(ads)
+            self._initial_batch_sent = True
+            self.initial_batch_mode = False
+            return
         if not self.notifications_ready:
             if not self._initial_skip_logged:
                 logger.info("Пропускаю уведомления для первого запуска (%s)", self.chat_owner)
@@ -131,6 +140,28 @@ class AvitoParse:
             ad.filter_interval_seconds = self.filter_interval_seconds
         if hasattr(ad, "filter_region_label"):
             ad.filter_region_label = self._current_region_label()
+
+    def _send_initial_batch_summary(self, ads: list[Item]) -> None:
+        if not ads:
+            return
+        chunk_size = 5
+        total = len(ads)
+        chunks = [ads[i:i + chunk_size] for i in range(0, len(ads), chunk_size)]
+        title = self.filter_title or (self.active_search.text if self.active_search else "Запрос")
+        for idx, chunk in enumerate(chunks, 1):
+            lines = [
+                f"✨ Стартовый пакет {idx}/{len(chunks)} для запроса {SendAdToTg._escape(title)} "
+                f"({len(chunk)} из {total})"
+            ]
+            for offset, ad in enumerate(chunk, 1):
+                title_text = SendAdToTg._escape(ad.title or "Без названия")
+                price_value = getattr(getattr(ad, "priceDetailed", None), "value", 0)
+                price_text = SendAdToTg._format_price(price_value)
+                full_url = f"https://www.avito.ru/{ad.urlPath}" if ad.urlPath else f"https://www.avito.ru/{ad.id}"
+                number = (idx - 1) * chunk_size + offset
+                lines.append(f"{number}. [{title_text}]({full_url}) — {price_text} ₽")
+            lines.append("Дальше я буду присылать объявления по одному с фото и ссылкой.")
+            self.tg_handler.send_to_tg(msg="\n".join(lines))
 
     def get_proxy_obj(self) -> Proxy | None:
         if all([self.config.proxy_string, self.config.proxy_change_url]):
@@ -613,9 +644,12 @@ class AvitoParse:
         return "global"
 
     def _initial_notifications_ready(self) -> bool:
-        chat_owner = getattr(self, "chat_owner", None)
         if not self.skip_initial_notifications:
             return True
+        return self._has_history()
+
+    def _has_history(self) -> bool:
+        chat_owner = getattr(self, "chat_owner", None)
         if not chat_owner or chat_owner == "global":
             return True
         try:
@@ -700,8 +734,10 @@ class AvitoParse:
         """Сохраняет просмотренные объявления"""
         try:
             self.db_handler.add_record_from_page(ads=ads, chat_id=chat_owner)
-            if not self.notifications_ready and chat_owner not in {None, "global"}:
+            if self.skip_initial_notifications and not self.notifications_ready and chat_owner not in {None, "global"}:
                 self.notifications_ready = True
+            if self.initial_batch_mode:
+                self.initial_batch_mode = False
         except Exception as err:
             logger.info(f"При сохранении в БД ошибка {err}")
 

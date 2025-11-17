@@ -24,7 +24,6 @@ from pathlib import Path
 
 from load_config import _load_dotenv_simple, _parse_chat_ids
 from user_filters import (
-    MAX_INTERVAL_SECONDS,
     MIN_INTERVAL_SECONDS,
     DEFAULT_INTERVAL_SECONDS,
     UserFiltersStorage,
@@ -345,7 +344,7 @@ def _parse_interval(text: str, default: Optional[int]) -> Optional[int]:
         return default
     if text.isdigit():
         value = int(text)
-        if MIN_INTERVAL_SECONDS <= value <= MAX_INTERVAL_SECONDS:
+        if value >= MIN_INTERVAL_SECONDS:
             return value
     return None
 
@@ -373,7 +372,7 @@ async def process_max_price(message: Message, state: FSMContext):
     current_interval = data.get("edit_filter", {}).get("interval_seconds") or DEFAULT_INTERVAL_SECONDS
     await state.set_state(FilterForm.interval)
     await message.answer(
-        f"⏱ Как часто проверять? Напиши число в секундах от {MIN_INTERVAL_SECONDS} до {MAX_INTERVAL_SECONDS} "
+        f"⏱ Как часто проверять? Напиши число в секундах (минимум {MIN_INTERVAL_SECONDS}) "
         f"или '-' чтобы оставить {current_interval} сек.",
     )
 
@@ -384,7 +383,7 @@ async def process_interval(message: Message, state: FSMContext):
     value = _parse_interval(message.text, current)
     if value is None:
         await message.answer(
-            f"Пожалуйста, число от {MIN_INTERVAL_SECONDS} до {MAX_INTERVAL_SECONDS} секунд или '-' чтобы оставить {current}."
+            f"Пожалуйста, число в секундах, минимум {MIN_INTERVAL_SECONDS}, или '-' чтобы оставить {current}."
         )
         return
     await state.update_data(interval=value)

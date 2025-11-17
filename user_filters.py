@@ -5,9 +5,16 @@ from typing import Optional, Dict, List
 
 from dto import SearchQuery
 
-DEFAULT_INTERVAL_SECONDS = 30
+DEFAULT_INTERVAL_SECONDS = 90
 MIN_INTERVAL_SECONDS = 2
-MAX_INTERVAL_SECONDS = 60
+MAX_INTERVAL_SECONDS: Optional[int] = None
+
+
+def _clamp_interval_value(value: int) -> int:
+    clamped = max(MIN_INTERVAL_SECONDS, value)
+    if MAX_INTERVAL_SECONDS is not None:
+        clamped = min(MAX_INTERVAL_SECONDS, clamped)
+    return clamped
 
 
 @dataclass
@@ -187,7 +194,7 @@ class UserFiltersStorage:
     ) -> int:
         self.ensure_user(chat_id, None)
         interval = interval_seconds if interval_seconds is not None else DEFAULT_INTERVAL_SECONDS
-        interval = max(MIN_INTERVAL_SECONDS, min(MAX_INTERVAL_SECONDS, interval))
+        interval = _clamp_interval_value(interval)
         with self._connect() as conn:
             cursor = conn.cursor()
             cursor.execute(
@@ -247,8 +254,7 @@ class UserFiltersStorage:
                     numeric = int(value)
                 except (TypeError, ValueError):
                     numeric = DEFAULT_INTERVAL_SECONDS
-                numeric = max(MIN_INTERVAL_SECONDS, min(MAX_INTERVAL_SECONDS, numeric))
-                params.append(numeric)
+                params.append(_clamp_interval_value(numeric))
             else:
                 params.append(value)
         if not updates:
