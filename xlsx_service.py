@@ -45,7 +45,10 @@ class XLSXHandler:
 
     @staticmethod
     def get_ad_time(ad: Item):
-        return datetime.fromtimestamp(ad.sortTimeStamp / 1000, tz=get_localzone()).replace(tzinfo=None)
+        stamp = getattr(ad, "sortTimeStamp", None)
+        if not stamp:
+            return datetime.now(tz=get_localzone()).replace(tzinfo=None)
+        return datetime.fromtimestamp(stamp / 1000, tz=get_localzone()).replace(tzinfo=None)
 
     @staticmethod
     def get_item_coords(ad: Item) -> str:
@@ -108,4 +111,3 @@ class XLSXHandler:
             sheet.append(row)
 
         workbook.save(self.file_name)
-

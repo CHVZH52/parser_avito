@@ -6,7 +6,7 @@ from typing import Optional, Dict, List
 from dto import SearchQuery
 
 DEFAULT_INTERVAL_SECONDS = 90
-MIN_INTERVAL_SECONDS = 2
+MIN_INTERVAL_SECONDS = 20
 MAX_INTERVAL_SECONDS: Optional[int] = None
 
 

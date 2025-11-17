@@ -30,7 +30,7 @@ from models import ItemsResponse, Item
 from tg_sender import SendAdToTg
 from version import VERSION
 from xlsx_service import XLSXHandler
-from paths_helper import user_xlsx_path
+from paths_helper import user_xlsx_path, user_cookies_path
 
 DEBUG_MODE = False
 
@@ -86,13 +86,13 @@ class AvitoParse:
         self.proxy_obj = self.get_proxy_obj()
         self.active_search = None
         self.result_dir = self._ensure_result_dir()
-        self.cookies_file = self._resolve_cookies_path()
-        self.db_path = self._resolve_db_path()
         self.chat_owner = getattr(self.config, "chat_owner", None) or self._resolve_chat_owner()
         self.filter_title = getattr(self.config, "filter_title", None)
         self.filter_interval_seconds = getattr(self.config, "filter_interval_seconds", None)
         self.skip_initial_notifications = getattr(self.config, "skip_first_notifications", False)
         self.export_user_id = getattr(self.config, "export_user_id", None)
+        self.cookies_file = self._resolve_cookies_path()
+        self.db_path = self._resolve_db_path()
         self._initial_has_history = self._has_history()
         self.initial_batch_mode = (not self.skip_initial_notifications and not self._initial_has_history
                                    and self.chat_owner not in {None, "global"})
@@ -664,13 +664,24 @@ class AvitoParse:
         return None
 
     def _resolve_cookies_path(self) -> Path:
-        default = Path(__file__).resolve().parent / "cookies.json"
+        owner = getattr(self, "chat_owner", None)
+        base_dir = Path(__file__).resolve().parent
+        if owner and owner != "global":
+            path = user_cookies_path(owner)
+        else:
+            path = base_dir / "cookies.json"
         try:
-            default.parent.mkdir(parents=True, exist_ok=True)
-            return default
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.touch(exist_ok=True)
+            return path
         except PermissionError:
-            fallback = Path(tempfile.gettempdir()) / "avito_parser_cookies.json"
-            fallback.parent.mkdir(parents=True, exist_ok=True)
+            fallback_base = Path(tempfile.gettempdir()) / "avito_parser_cookies"
+            fallback_base.mkdir(parents=True, exist_ok=True)
+            if owner and owner != "global":
+                fallback = user_cookies_path(owner, base_dir=fallback_base)
+            else:
+                fallback = fallback_base / "cookies.json"
+            fallback.touch(exist_ok=True)
             logger.info(f"Используем {fallback} для cookies из-за прав доступа")
             return fallback
 

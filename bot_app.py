@@ -30,6 +30,7 @@ from user_filters import (
     UserProfile,
 )
 from paths_helper import user_xlsx_path
+from loguru import logger
 
 storage = UserFiltersStorage()
 START_STICKER_ID = "CAACAgIAAxkBAAEIB0Zk3u7P5AnbcW2CYwiVdc0GqORdzAACnRcAAnlc4Ub1Z4VHKakiOTQE"
@@ -148,6 +149,7 @@ async def send_help(target_message: Message):
 async def send_xlsx_file(target_message: Message):
     path = user_xlsx_path(target_message.chat.id)
     if not path.exists():
+        logger.info("Запрос XLSX: у пользователя %s ещё нет данных", target_message.chat.id)
         await target_message.answer(
             "Пока нечего выгружать 💞 Добавь поисковый запрос и дождись первой проверки — тогда появится файл."
         )
@@ -158,16 +160,20 @@ async def send_xlsx_file(target_message: Message):
             document=doc,
             caption="Последняя выгрузка по твоим фильтрам",
         )
+        logger.info("Отправлен XLSX пользователю %s", target_message.chat.id)
     except Exception as err:
+        logger.exception("Ошибка отправки XLSX пользователю %s: %s", target_message.chat.id, err)
         await target_message.answer(f"Не удалось отправить файл: {err}")
 
 
 async def start_cmd(message: Message, state: FSMContext):
     if ALLOWED_CHAT_IDS and message.chat.id not in ALLOWED_CHAT_IDS:
+        logger.warning("Доступ к боту отклонён (chat_id=%s)", message.chat.id)
         await message.answer("👮 Доступ ограничен. Обратитесь к команде ЧВЖ для доступа.")
         return
     await state.clear()
     storage.ensure_user(message.chat.id, message.from_user.username)
+    logger.info("Пользователь %s начал работу (username=%s)", message.chat.id, message.from_user.username)
     if START_STICKER_ID:
         try:
             await message.answer_sticker(START_STICKER_ID)
@@ -201,6 +207,7 @@ async def help_cmd(message: Message):
 async def add_filter_cmd(message: Message, state: FSMContext):
     if ALLOWED_CHAT_IDS and message.chat.id not in ALLOWED_CHAT_IDS:
         return
+    logger.info("Пользователь %s запускает мастер добавления запроса", message.chat.id)
     await start_filter_wizard(message, state)
 
 
@@ -215,6 +222,7 @@ async def add_filter_entry(message: Message, state: FSMContext):
         return
     if message.text != ADD_QUERY_LABEL:
         return
+    logger.info("Пользователь %s нажал кнопку %s", message.chat.id, ADD_QUERY_LABEL)
     await start_filter_wizard(message, state)
 
 
@@ -431,6 +439,11 @@ async def process_track(callback: CallbackQuery, state: FSMContext):
             track_price_changes=track_value,
             interval_seconds=interval_to_use,
         )
+        logger.info(
+            "Параметры фильтра #%s обновлены пользователем %s",
+            filt["id"],
+            chat_id,
+        )
         await callback.message.answer("Параметры фильтра обновлены", reply_markup=MENU_KB)
     else:
         interval_to_use = interval_value if interval_value is not None else DEFAULT_INTERVAL_SECONDS
@@ -448,6 +461,12 @@ async def process_track(callback: CallbackQuery, state: FSMContext):
                 interval_seconds=interval_to_use,
             )
             created += 1
+        logger.info(
+            "Пользователь %s добавил %s поисковых запросов: %s",
+            chat_id,
+            created,
+            ", ".join(queries),
+        )
         await callback.message.answer(
             f"Добавлено поисковых запросов: {created}",
             reply_markup=MENU_KB,

@@ -13,3 +13,10 @@ def user_xlsx_path(chat_identifier: str | int, base_dir: Path | None = None) -> 
     root = Path(base_dir) if base_dir else Path(__file__).resolve().parent / "result"
     segment = _sanitize_segment(chat_identifier)
     return root / "users" / segment / "monitoring.xlsx"
+
+
+def user_cookies_path(chat_identifier: str | int, base_dir: Path | None = None) -> Path:
+    """Возвращает путь к файлу cookies пользователя."""
+    root = Path(base_dir) if base_dir else Path(__file__).resolve().parent / "cookies"
+    segment = _sanitize_segment(chat_identifier)
+    return root / f"{segment}.json"
