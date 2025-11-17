@@ -273,7 +273,8 @@ async def start_filter_wizard(target: Message, state: FSMContext, profile: Optio
     await state.update_data(mode="create", profile=profile.__dict__, sort_new=profile.default_sort_new)
     await target.answer(
         "🪄 Введи один или несколько поисковых запросов.\n"
-        "Можно через запятую или с новой строки (пример: `Pioneer DDJ FLX4, iPhone 16 Pro`).",
+        "Можно через запятую или с новой строки (пример: `Pioneer DDJ FLX4, iPhone 16 Pro`).\n"
+        "Если нужен точный запрос — оберни его в кавычки: `\"айфон 16\"`.",
         parse_mode=ParseMode.MARKDOWN,
     )
 

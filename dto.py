@@ -67,3 +67,4 @@ class AvitoConfig:
     filter_interval_seconds: Optional[int] = None
     export_user_id: Optional[str] = None
     skip_first_notifications: bool = False
+    initial_summary_sent: bool = False

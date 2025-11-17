@@ -91,12 +91,17 @@ class AvitoParse:
         self.filter_interval_seconds = getattr(self.config, "filter_interval_seconds", None)
         self.skip_initial_notifications = getattr(self.config, "skip_first_notifications", False)
         self.export_user_id = getattr(self.config, "export_user_id", None)
+        self.filters_storage = UserFiltersStorage()
+        self.filters_storage = UserFiltersStorage()
         self.cookies_file = self._resolve_cookies_path()
         self.db_path = self._resolve_db_path()
-        self._initial_has_history = self._has_history()
-        self.initial_batch_mode = (not self.skip_initial_notifications and not self._initial_has_history
-                                   and self.chat_owner not in {None, "global"})
-        self._initial_batch_sent = False
+        self.initial_summary_sent = getattr(self.config, "initial_summary_sent", False)
+        self.initial_batch_mode = (
+            not self.skip_initial_notifications
+            and not self.initial_summary_sent
+            and self.chat_owner not in {None, "global"}
+        )
+        self.initial_batch_buffer: list[Item] = []
         self.db_handler = SQLiteDBHandler(db_name=str(self.db_path))
         self.tg_handler = self.get_tg_handler()
         self.xlsx_handler = XLSXHandler(self.__get_file_title())
@@ -119,10 +124,8 @@ class AvitoParse:
     def _send_to_tg(self, ads: list[Item]) -> None:
         if not self.tg_handler:
             return
-        if self.initial_batch_mode and not self._initial_batch_sent:
-            self._send_initial_batch_summary(ads)
-            self._initial_batch_sent = True
-            self.initial_batch_mode = False
+        if self.initial_batch_mode:
+            self.initial_batch_buffer.extend(ads)
             return
         if not self.notifications_ready:
             if not self._initial_skip_logged:
@@ -162,6 +165,13 @@ class AvitoParse:
                 lines.append(f"{number}. [{title_text}]({full_url}) — {price_text} ₽")
             lines.append("Дальше я буду присылать объявления по одному с фото и ссылкой.")
             self.tg_handler.send_to_tg(msg="\n".join(lines))
+        self.initial_summary_sent = True
+        chat_value = self.export_user_id
+        try:
+            if chat_value and self.config.filter_id:
+                self.filters_storage.mark_initial_summary_sent(int(chat_value), self.config.filter_id)
+        except Exception as err:
+            logger.debug("Не удалось отметить отправку стартового пакета: %s", err)
 
     def get_proxy_obj(self) -> Proxy | None:
         if all([self.config.proxy_string, self.config.proxy_change_url]):
@@ -333,6 +343,11 @@ class AvitoParse:
                 self.__save_data(ads=ads_in_link)
             else:
                 logger.info("Сохранять нечего")
+
+            if self.initial_batch_mode and self.initial_batch_buffer:
+                self._send_initial_batch_summary(self.initial_batch_buffer)
+                self.initial_batch_buffer.clear()
+                self.initial_batch_mode = False
 
             if self.config.one_file_for_link:
                 self.xlsx_handler = None

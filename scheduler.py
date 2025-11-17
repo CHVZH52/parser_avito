@@ -47,6 +47,7 @@ def _build_config(base_config: AvitoConfig, row, interval: int) -> AvitoConfig:
     cfg.filter_title = search.text
     cfg.filter_interval_seconds = interval
     cfg.export_user_id = str(row["chat_id"])
+    cfg.initial_summary_sent = bool(row["initial_summary_sent"])
     return cfg
 
 

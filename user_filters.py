@@ -81,6 +81,7 @@ class UserFiltersStorage:
                     sort_new INTEGER,
                     track_price_changes INTEGER DEFAULT 1,
                     interval_minutes INTEGER DEFAULT {DEFAULT_INTERVAL_SECONDS},
+                    initial_summary_sent INTEGER DEFAULT 0,
                     FOREIGN KEY(chat_id) REFERENCES users(chat_id) ON DELETE CASCADE
                 )
                 """
@@ -92,6 +93,12 @@ class UserFiltersStorage:
                 f"INTEGER DEFAULT {DEFAULT_INTERVAL_SECONDS}",
             )
             self._ensure_interval_seconds(conn)
+            self._ensure_column(
+                conn,
+                "filters",
+                "initial_summary_sent",
+                "INTEGER DEFAULT 0",
+            )
             conn.commit()
 
     @staticmethod
@@ -199,8 +206,8 @@ class UserFiltersStorage:
             cursor = conn.cursor()
             cursor.execute(
                 """
-                INSERT INTO filters (chat_id, text, region, min_price, max_price, delivery, sort_new, track_price_changes, interval_seconds)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO filters (chat_id, text, region, min_price, max_price, delivery, sort_new, track_price_changes, interval_seconds, initial_summary_sent)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
                 """,
                 (
                     chat_id,
@@ -313,3 +320,6 @@ class UserFiltersStorage:
                 """
             ).fetchall()
         return rows
+
+    def mark_initial_summary_sent(self, chat_id: int, filter_id: int) -> None:
+        self.update_filter(filter_id, chat_id, initial_summary_sent=1)
